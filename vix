@@ -1,0 +1,1183 @@
+#!/usr/bin/awk -f
+
+MAX_GENERATIONS = 30
+
+# Функция для точного определения домашней папки (работает и с sudo, и без)
+function get_user_home(   cmd, line, home) {
+    cmd = "echo $SUDO_USER"
+    if ((cmd | getline line) > 0 && line != "") {
+        home = "/home/" line
+    } else {
+        close(cmd)
+        cmd = "echo $USER"
+        if ((cmd | getline line) > 0) {
+            if (line == "root") home = "/root"
+            else home = "/home/" line
+        } else {
+            home = "/home/default"
+        }
+    }
+    close(cmd)
+    gsub(/[ \t\r\n]/, "", home)
+    return home
+}
+
+# Функция для безопасного создания папок
+function mkdir_p(dir) {
+    system("mkdir -p \"" dir "\"")
+}
+
+# Блокировка: не даёт двум процессам vix одновременно менять систему.
+# Директория lock-а создаётся атомарно (mkdir либо создаст, либо упадёт, если
+# уже есть) - в отличие от файла, это гонко-безопасно на уровне ФС.
+function acquire_lock(   pid_file, existing_pid, alive) {
+    if (system("mkdir \"" LOCKDIR "\" 2>/dev/null") != 0) {
+        pid_file = LOCKDIR "/pid"
+        existing_pid = ""
+        if ((getline existing_pid < pid_file) > 0) gsub(/[ \t\r\n]/, "", existing_pid)
+        close(pid_file)
+
+        alive = (existing_pid != "" && system("kill -0 " existing_pid " 2>/dev/null") == 0)
+
+        if (alive) {
+            print "\033[31m" "Ошибка: Другой процесс vix уже выполняется (PID " existing_pid ")." "\033[0m"
+            print "Если это не так (процесс завис/убит), удалите вручную: " LOCKDIR
+            exit 1
+        }
+
+        print "Обнаружена зависшая блокировка (процесс " existing_pid " больше не активен), снимаю..."
+        system("rm -rf \"" LOCKDIR "\"")
+        if (system("mkdir \"" LOCKDIR "\" 2>/dev/null") != 0) {
+            print "\033[31m" "Ошибка: Не удалось захватить блокировку " LOCKDIR "\033[0m"
+            exit 1
+        }
+    }
+    print PROCINFO["pid"] > (LOCKDIR "/pid")
+    close(LOCKDIR "/pid")
+    LOCK_ACQUIRED = 1
+}
+
+function release_lock() {
+    if (LOCK_ACQUIRED) {
+        system("rm -rf \"" LOCKDIR "\"")
+        LOCK_ACQUIRED = 0
+    }
+}
+
+# Оставляет только MAX_GENERATIONS последних (по времени) поколений в store/.
+# Текущее поколение (store/current) никогда не удаляется, даже если оно
+# старше остальных - например, сразу после rollback на старый снапшот.
+function prune_old_generations(   gens_cmd, gdir, gen_count, i, cur_dir, readlink_cmd, removed, plist) {
+    gens_cmd = "find \"" VOID_STORE "\" -mindepth 1 -maxdepth 1 -type d ! -name current -print0 2>/dev/null | xargs -0r ls -td 2>/dev/null"
+    gen_count = 0
+    while ((gens_cmd | getline gdir) > 0) plist[++gen_count] = gdir
+    close(gens_cmd)
+
+    if (gen_count <= MAX_GENERATIONS) return
+
+    cur_dir = ""
+    readlink_cmd = "readlink -f \"" VOID_STORE "/current\" 2>/dev/null"
+    if ((readlink_cmd | getline cur_dir) > 0) gsub(/[ \t\r\n]/, "", cur_dir)
+    close(readlink_cmd)
+
+    removed = 0
+    for (i = 1; i <= gen_count; i++) {
+        if (i <= MAX_GENERATIONS) continue
+        if (plist[i] == cur_dir) continue
+        system("chmod -R u+w \"" plist[i] "\" 2>/dev/null")
+        system("rm -rf \"" plist[i] "\"")
+        removed++
+    }
+    if (removed > 0) {
+        print "-> Сборка мусора: удалено старых поколений: " removed " (лимит хранения: " MAX_GENERATIONS ")"
+    }
+}
+
+# Хэш содержимого папки (рекурсивно, пути относительные - не зависят от расположения папки)
+function get_dir_hash(dir,    cmd, h) {
+    if (system("[ -d \"" dir "\" ]") != 0) return ""
+    cmd = "(cd \"" dir "\" 2>/dev/null && find . -type f -print0 | sort -z | xargs -0 sha256sum 2>/dev/null) | sha256sum | cut -d' ' -f1"
+    h = ""
+    if ((cmd | getline h) > 0) gsub(/[ \t\r\n]/, "", h)
+    close(cmd)
+    return h
+}
+
+# Хэш одного файла
+function get_file_hash(file,    cmd, h) {
+    if (system("[ -f \"" file "\" ]") != 0) return ""
+    cmd = "sha256sum \"" file "\" 2>/dev/null | cut -d' ' -f1"
+    h = ""
+    if ((cmd | getline h) > 0) gsub(/[ \t\r\n]/, "", h)
+    close(cmd)
+    return h
+}
+
+# Комбинированный хэш всех папок, зарегистрированных через 'vix add' (extra.vix).
+# is_store=0 - считаем по живым папкам в VOID_CONFIG; is_store=1 - по слепку
+# last_store_dir/extra.vix + last_store_dir/extra/<name>/ (нужен для Шага А).
+# В хэш попадают и путь-источник, и имя - переподключение той же папки под
+# другим путём тоже считается изменением.
+function get_extra_combined_hash(is_store,   ef, name, ex_path, eq, line_, h, dpath, any, tmp_file, mktemp_cmd, hash_cmd, result) {
+    ef = is_store ? (last_store_dir "/extra.vix") : EXTRA_FILE
+    if (system("[ -f \"" ef "\" ]") != 0) return ""
+
+    tmp_file = ""
+    mktemp_cmd = "mktemp /tmp/vix_extra_buf.XXXXXX 2>/dev/null"
+    if ((mktemp_cmd | getline tmp_file) > 0) gsub(/[ \t\r\n]/, "", tmp_file)
+    close(mktemp_cmd)
+    if (tmp_file == "") tmp_file = "/tmp/vix_extra_buf." PROCINFO["pid"]
+
+    any = 0
+    while ((getline line_ < ef) > 0) {
+        if (line_ == "") continue
+        eq = index(line_, "=")
+        if (eq <= 0) continue
+        name = substr(line_, 1, eq-1)
+        ex_path = substr(line_, eq+1)
+        dpath = is_store ? (last_store_dir "/extra/" name) : (VOID_CONFIG "/" name)
+        h = get_dir_hash(dpath)
+        print name "=" ex_path ":" h >> tmp_file
+        any = 1
+    }
+    close(ef)
+    close(tmp_file)
+
+    if (!any) { system("rm -f \"" tmp_file "\""); return "" }
+
+    hash_cmd = "sort \"" tmp_file "\" | sha256sum | cut -d' ' -f1"
+    result = ""
+    if ((hash_cmd | getline result) > 0) gsub(/[ \t\r\n]/, "", result)
+    close(hash_cmd)
+    system("rm -f \"" tmp_file "\"")
+    return result
+}
+
+# Общий хэш конфигурации (дотфайлы + пакеты + сервисы + репозитории [+ доп.
+# папки, если 'vix add' использовался]). Используется и для имени слепка в
+# store/, и для сравнения "до/после" выполнения шагов.
+function compute_combined_hash(   cmd, h, extra_h) {
+    cmd = "(find \"" DOTFILES "\" -type f -print0 | sort -z | xargs -0 sha256sum; " \
+          "[ -f \"" PKG_FILE "\" ] && sha256sum \"" PKG_FILE "\"; " \
+          "[ -f \"" SVC_FILE "\" ] && sha256sum \"" SVC_FILE "\"; " \
+          "[ -f \"" REPO_FILE "\" ] && sha256sum \"" REPO_FILE "\""
+    if (has_extra) {
+        extra_h = get_extra_combined_hash(0)
+        cmd = cmd "; echo \"extra:" extra_h "\""
+    }
+    cmd = cmd ") | sha256sum | cut -d' ' -f1"
+    h = ""
+    if ((cmd | getline h) > 0) gsub(/[ \t\r\n]/, "", h)
+    close(cmd)
+    return h
+}
+
+# Функция для чистки имени пакета от версий и знаков сравнения (сохраняя дефисы в имени)
+function clean_package_name(pkg) {
+    if (pkg ~ /[><=]/) {
+        split(pkg, parts, "[><=]")
+        pkg = parts[1]
+    }
+    gsub(/-[0-9].*$/, "", pkg)
+    gsub(/[ \t\r\n]/, "", pkg)
+    return pkg
+}
+
+# Генерация/обновление контента для packages.vix строго в алфавитном порядке
+function generate_packages_config(target_file,    xbps_cmd, pkg, i, count, sorted_pkgs) {
+    print "# Автоматически сгенерированный список пакетов VIX" > target_file
+    print "  -> Сбор и индексация локальной базы пакетов..."
+    
+    count = 0
+    xbps_cmd = "xbps-query -l | awk '{print $2}'" 
+    while ((xbps_cmd | getline pkg) > 0) {
+        pkg = clean_package_name(pkg)
+        if (pkg != "") sorted_pkgs[++count] = pkg
+    }
+    close(xbps_cmd)
+    
+    asort(sorted_pkgs)
+
+    delete seen_pkgs_gen
+    for (i = 1; i <= count; i++) {
+        pkg = sorted_pkgs[i]
+        if (pkg in seen_pkgs_gen) continue
+        seen_pkgs_gen[pkg] = 1
+        print pkg >> target_file
+    }
+}
+
+# Двухсекционная генерация сервисов без дубликатов (var/service верх, etc/sv низ)
+function generate_services_config(target_file,    sv_cmd, service, active_count, inactive_count, active_list, inactive_list, i) {
+    active_count = 0
+    inactive_count = 0
+
+    sv_cmd = "find /etc/sv -maxdepth 1 -mindepth 1 -type d"
+    while ((sv_cmd | getline service) > 0) {
+        sub(".*/", "", service)
+        if (service == "") continue
+        
+        if (system("[ -L \"/var/service/" service "\" ]") == 0) {
+            active_list[++active_count] = service
+        } else {
+            inactive_list[++inactive_count] = service
+        }
+    }
+    close(sv_cmd)
+
+    asort(active_list)
+    asort(inactive_list)
+
+    print "# Автоматически сгенерированный список сервисов VIX\n" > target_file
+    
+    print "# var/service" >> target_file
+    for (i = 1; i <= active_count; i++) {
+        if (system("[ -f \"/etc/sv/" active_list[i] "/down\" ]") == 0) {
+            print active_list[i] " = false" >> target_file
+        } else {
+            print active_list[i] " = true" >> target_file
+        }
+    }
+
+    print "\n# etc/sv" >> target_file
+    for (i = 1; i <= inactive_count; i++) {
+        print inactive_list[i] " = false" >> target_file
+    }
+}
+
+# Записывает содержимое одной директории (плоско) в уже открытый на запись файл
+function serialize_repo_section(src_dir, target_flat_file,    find_cmd, rfile, line) {
+    find_cmd = "find \"" src_dir "\" -maxdepth 1 -type f 2>/dev/null"
+    while ((find_cmd | getline rfile) > 0) {
+        sub(".*/", "", rfile)
+        print "@@FILE:" rfile >> target_flat_file
+        while ((getline line < (src_dir "/" rfile)) > 0) {
+            print line >> target_flat_file
+        }
+        close(src_dir "/" rfile)
+    }
+    close(find_cmd)
+}
+
+# Сериализует usr/share/xbps.d и etc/xbps.d в ОДИН файл repo.vix, разделяя
+# секции комментариями-заголовками (именно в этом порядке: share, потом etc).
+function serialize_repo_all(target_file) {
+    print "#usr/share/xbps.d" > target_file
+    serialize_repo_section("/usr/share/xbps.d", target_file)
+    print "" >> target_file
+    print "#etc/xbps.d" >> target_file
+    serialize_repo_section("/etc/xbps.d", target_file)
+    close(target_file)
+}
+
+# Сравнивает временный буфер с реальным файлом в системе и при расхождении
+# копирует (через sudo). Возвращает 1, если было изменение.
+function repo_flush(target_sys_dir, current_file, tmp_file,    changed) {
+    if (current_file == "" || tmp_file == "") return 0
+    close(tmp_file)
+    changed = 0
+    if (system("cmp -s \"" tmp_file "\" \"" target_sys_dir "/" current_file "\"") != 0) {
+        print "  [!] Изменение -> Обновляю репозиторий: " target_sys_dir "/" current_file
+        system("sudo cp -f \"" tmp_file "\" \"" target_sys_dir "/" current_file "\"")
+        changed = 1
+    }
+    system("rm -f \"" tmp_file "\"")
+    return changed
+}
+
+# Десериализация ОДНОГО файла repo.vix обратно в /usr/share/xbps.d и /etc/xbps.d
+# с проверкой изменений на уровне отдельных файлов внутри каждой секции.
+function deserialize_repo_all(flat_file,    target_sys_dir, current_file, tmp_file, line, global_changed, mktemp_cmd) {
+    if (system("[ -f \"" flat_file "\" ]") != 0) return 0
+
+    global_changed = 0
+    target_sys_dir = ""
+    current_file = ""
+    tmp_file = ""
+
+    while ((getline line < flat_file) > 0) {
+        if (line == "#usr/share/xbps.d" || line == "#etc/xbps.d") {
+            if (repo_flush(target_sys_dir, current_file, tmp_file)) global_changed = 1
+            current_file = ""; tmp_file = ""
+            target_sys_dir = (line == "#usr/share/xbps.d") ? "/usr/share/xbps.d" : "/etc/xbps.d"
+            system("sudo mkdir -p \"" target_sys_dir "\"")
+            continue
+        }
+        if (line == "") continue
+        if (line ~ /^@@FILE:/) {
+            if (repo_flush(target_sys_dir, current_file, tmp_file)) global_changed = 1
+            sub(/^@@FILE:/, "", line)
+            current_file = line
+
+            # Небезопасно использовать предсказуемое имя в /tmp вместе с sudo cp
+            # (симлинк-атака) - создаём файл атомарно и эксклюзивно через mktemp.
+            tmp_file = ""
+            mktemp_cmd = "mktemp /tmp/vix_repo_buf.XXXXXX 2>/dev/null"
+            if ((mktemp_cmd | getline tmp_file) > 0) gsub(/[ \t\r\n]/, "", tmp_file)
+            close(mktemp_cmd)
+            if (tmp_file == "") tmp_file = "/tmp/vix_repo_buf." PROCINFO["pid"] "." current_file
+
+            printf "" > tmp_file
+            close(tmp_file)
+            continue
+        }
+        if (current_file != "" && target_sys_dir != "") {
+            print line >> tmp_file
+        }
+    }
+    close(flat_file)
+
+    if (repo_flush(target_sys_dir, current_file, tmp_file)) global_changed = 1
+
+    return global_changed
+}
+
+# Подключает строку 'marker' в профильный файл pf (идемпотентно - не дублирует
+# при повторных запусках). create_if_missing=1 - создать файл, если его нет
+# (используется для ~/.profile, читаемого большинством shell по умолчанию).
+function ensure_profile_sources(pf, marker, create_if_missing) {
+    if (system("[ -f \"" pf "\" ]") != 0) {
+        if (!create_if_missing) return
+        system("touch \"" pf "\"")
+    }
+    if (system("grep -qF '" marker "' \"" pf "\" 2>/dev/null") != 0) {
+        print "" >> pf
+        print "# VIX: выбор поколения дотфайлов (добавлено автоматически)" >> pf
+        print marker >> pf
+        close(pf)
+    }
+}
+
+# Пишет скрипт окружения прямо в config.vix/ (не требует root, т.к. это
+# папка пользователя) и подключает его через ~/.profile / ~/.bash_profile /
+# ~/.zprofile - без /etc/profile.d и без sudo.
+function write_env_script(home,    pfile, marker) {
+    pfile = home "/config.vix/vix_env.sh"
+
+    print "#!/bin/sh" > pfile
+    print "# Универсальный выбор XDG_CONFIG_HOME по симлинку текущего поколения VIX" >> pfile
+    print "# (не зависит от загрузчика - работает одинаково с GRUB, rEFInd, systemd-boot и т.д.)" >> pfile
+    print "VIX_CURRENT=\"" home "/config.vix/store/current/dotfiles\"" >> pfile
+    print "if [ -d \"$VIX_CURRENT\" ]; then" >> pfile
+    print "    export XDG_CONFIG_HOME=\"$VIX_CURRENT\"" >> pfile
+    print "    find \"$XDG_CONFIG_HOME\" -maxdepth 1 -type f -name '.*' | while IFS= read -r f; do" >> pfile
+    print "        echo \"source $f\" > \"" home "/$(basename $f)\"" >> pfile
+    print "        chmod +x \"" home "/$(basename $f)\"" >> pfile
+    print "    done" >> pfile
+    print "else" >> pfile
+    print "    export XDG_CONFIG_HOME=\"" home "/config.vix/dotfiles\"" >> pfile
+    print "fi" >> pfile
+    close(pfile)
+    system("chmod +x \"" pfile "\"")
+
+    marker = ". \"" pfile "\""
+    ensure_profile_sources(home "/.profile", marker, 1)
+    ensure_profile_sources(home "/.bash_profile", marker, 0)
+    ensure_profile_sources(home "/.zprofile", marker, 0)
+
+    print "Скрипт окружения обновлён: " pfile " (подключён через ~/.profile)"
+}
+
+BEGIN {
+    USER_HOME = get_user_home()
+
+    cmd = ARGV[1]
+    known_cmd = (cmd == "switch" || cmd == "s" || \
+                 cmd == "sync" || cmd == "list" || cmd == "l" || cmd == "rollback" || cmd == "r" || \
+                 cmd == "add" || cmd == "a")
+
+    if (known_cmd && system("[ -d \"" USER_HOME "\" ]") != 0) {
+        print "\033[31m" "Ошибка: Не удалось определить домашнюю папку пользователя (получено: '" USER_HOME "')." "\033[0m"
+        print "Проверьте переменные окружения $SUDO_USER / $USER и запустите снова."
+        exit 1
+    }
+
+    VOID_CONFIG = USER_HOME "/config.vix"
+    DOTFILES = VOID_CONFIG "/dotfiles"
+    VOID_STORE = VOID_CONFIG "/store"
+    REPO_FILE = VOID_CONFIG "/repo.vix"
+
+    PKG_FILE = VOID_CONFIG "/packages.vix"
+    SVC_FILE = VOID_CONFIG "/services.vix"
+    TMP_PKG_FILE = VOID_CONFIG "/packages.vix.tmp"
+    TMP_SVC_FILE = VOID_CONFIG "/services.vix.tmp"
+    EXTRA_FILE = VOID_CONFIG "/extra.vix"
+
+    # Имена, зарезервированные под служебные файлы/папки в корне config.vix -
+    # 'vix add' не даст добавить папку с таким именем.
+    RESERVED_NAMES = "|dotfiles|store|packages.vix|services.vix|repo.vix|extra.vix|packages.vix.tmp|services.vix.tmp|"
+
+    # Сколько последних поколений хранить в store/ (сборка мусора после switch)
+    #MAX_GENERATIONS = 30
+
+    # Блокировка - только для команд, которые реально меняют систему/конфиг.
+    # Ключ блокировки привязан к домашней папке пользователя (не к config.vix,
+    # т.к. для первого 'vix sync' этой папки ещё не существует на момент захвата).
+    if (cmd == "switch" || cmd == "s" || \
+        cmd == "sync" || cmd == "rollback" || cmd == "r" || cmd == "add" || cmd == "a") {
+        safe_user = USER_HOME
+        gsub(/[^a-zA-Z0-9]/, "_", safe_user)
+        LOCKDIR = "/tmp/.vix-lock-" safe_user
+        acquire_lock()
+    }
+    
+    # --- КОМАНДА: SYNC (Система -> Файл; создаёт config.vix, если его ещё нет) ---
+    if (cmd == "sync") {
+        print "=== Синхронизация: Система -> Конфигурация VIX ==="
+
+        is_new = (system("[ -d \"" VOID_CONFIG "\" ]") != 0)
+        if (is_new) print "Определена домашняя папка: " USER_HOME
+
+        mkdir_p(DOTFILES)
+        mkdir_p(VOID_STORE)
+
+        old_config = USER_HOME "/.config"
+        if (system("[ -d \"" old_config "\" ]") == 0) {
+            print "Импортирую содержимое ~/.config ..."
+            system("cp -a \"" old_config "\"/* \"" DOTFILES "\" 2>/dev/null")
+        }
+
+        print "Импортирую точечные файлы из корня " USER_HOME " ..."
+        dot_cmd = "find \"" USER_HOME "\" -maxdepth 1 -type f -name '.*'"
+        while ((dot_cmd | getline dotfile) > 0) {
+            system("cp -a \"" dotfile "\" \"" DOTFILES "/\" 2>/dev/null")
+        }
+        close(dot_cmd)
+
+        print "Перезаписываю декларации пакетов, репозиториев и сервисов..."
+        serialize_repo_all(REPO_FILE)
+        generate_services_config(SVC_FILE)
+        generate_packages_config(PKG_FILE)
+
+        cmd_user = "echo $SUDO_USER"
+        if ((cmd_user | getline real_user) > 0 && real_user != "") {
+            gsub(/[ \t\r\n]/, "", real_user)
+            system("chown -R " real_user ":" real_user " \"" VOID_CONFIG "\"")
+        }
+        close(cmd_user)
+
+        write_env_script(USER_HOME)
+
+        print "Синхронизация завершена успешно!"
+        print "-> Слепок не создаётся и /store не трогается. Чтобы применить это к системе, выполните 'vix switch'."
+        exit 0
+    }
+
+    # --- КОМАНДА: ADD (Зарегистрировать пользовательскую папку) ---
+    if (cmd == "add" || cmd == "a") {
+        print "=== Добавление пользовательской папки в VIX ==="
+        if (system("[ -d \"" VOID_CONFIG "\" ]") != 0) {
+            print "\033[31m" "Ошибка: Сначала выполните 'vix sync'" "\033[0m"
+            exit 1
+        }
+
+        add_arg = ARGV[2]
+        if (add_arg == "") {
+            print "\033[31m" "Ошибка: Укажите путь к папке. Использование: vix add /путь/к/папке" "\033[0m"
+            exit 1
+        }
+
+        # Разворачиваем в канонический абсолютный путь (раскрывает ~, симлинки, ..)
+        resolve_cmd = "readlink -f \"" add_arg "\" 2>/dev/null"
+        add_path = ""
+        if ((resolve_cmd | getline add_path) > 0) gsub(/[ \t\r\n]/, "", add_path)
+        close(resolve_cmd)
+        if (add_path == "" || system("[ -d \"" add_path "\" ]") != 0) {
+            print "\033[31m" "Ошибка: '" add_arg "' не найден или не является папкой." "\033[0m"
+            exit 1
+        }
+
+        n = split(add_path, add_parts, "/")
+        add_name = add_parts[n]
+        if (add_name == "") {
+            print "\033[31m" "Ошибка: Не удалось определить имя папки из пути " add_path "\033[0m"
+            exit 1
+        }
+        if (index(RESERVED_NAMES, "|" add_name "|") > 0) {
+            print "\033[31m" "Ошибка: Имя '" add_name "' зарезервировано под служебные файлы VIX, выберите другую папку." "\033[0m"
+            exit 1
+        }
+        if (add_name ~ /=/) {
+            print "\033[31m" "Ошибка: Имя папки не должно содержать символ '='." "\033[0m"
+            exit 1
+        }
+
+        add_dest = VOID_CONFIG "/" add_name
+
+        already_registered = 0
+        if (system("[ -f \"" EXTRA_FILE "\" ]") == 0) {
+            while ((getline add_check < EXTRA_FILE) > 0) {
+                add_eq = index(add_check, "=")
+                if (add_eq > 0 && substr(add_check, 1, add_eq-1) == add_name) already_registered = 1
+            }
+            close(EXTRA_FILE)
+        }
+
+        if (!already_registered && system("[ -e \"" add_dest "\" ]") == 0) {
+            print "\033[31m" "Ошибка: config.vix/" add_name " уже существует и не зарегистрирована через 'vix add'." "\033[0m"
+            print "Переименуйте исходную папку или уберите конфликт вручную."
+            exit 1
+        }
+
+        print "-> Импортирую " add_path " -> config.vix/" add_name " ..."
+        mkdir_p(add_dest)
+        system("find \"" add_dest "\" -mindepth 1 -maxdepth 1 -exec rm -rf {} +")
+        system("cp -a \"" add_path "\"/. \"" add_dest "\"/ 2>/dev/null")
+
+        # Перезаписываем строку реестра (на случай повторного add с тем же именем)
+        add_tmp = ""
+        add_mktemp_cmd = "mktemp /tmp/vix_extra_reg.XXXXXX 2>/dev/null"
+        if ((add_mktemp_cmd | getline add_tmp) > 0) gsub(/[ \t\r\n]/, "", add_tmp)
+        close(add_mktemp_cmd)
+        if (add_tmp == "") add_tmp = "/tmp/vix_extra_reg." PROCINFO["pid"]
+
+        if (system("[ -f \"" EXTRA_FILE "\" ]") == 0) {
+            while ((getline add_line < EXTRA_FILE) > 0) {
+                if (add_line == "") continue
+                add_eq2 = index(add_line, "=")
+                if (add_eq2 > 0 && substr(add_line, 1, add_eq2-1) == add_name) continue
+                print add_line >> add_tmp
+            }
+            close(EXTRA_FILE)
+        }
+        print add_name "=" add_path >> add_tmp
+        close(add_tmp)
+        system("mv \"" add_tmp "\" \"" EXTRA_FILE "\"")
+
+        cmd_user = "echo $SUDO_USER"
+        if ((cmd_user | getline real_user) > 0 && real_user != "") {
+            gsub(/[ \t\r\n]/, "", real_user)
+            system("chown -R " real_user ":" real_user " \"" add_dest "\"")
+            system("chown " real_user ":" real_user " \"" EXTRA_FILE "\"")
+        }
+        close(cmd_user)
+
+        add_verb = already_registered ? "-> Обновлено: " : "-> Зарегистрировано: "
+        print add_verb add_name " -> " add_path
+        print "-> При следующем 'vix switch' появится Шаг Е, который будет следить за этой папкой."
+        exit 0
+    }
+
+    # --- КОМАНДА: LIST (Список поколений) ---
+    if (cmd == "list" || cmd == "l") {
+        print "=== Поколения VIX ==="
+        if (system("[ -d \"" VOID_STORE "\" ]") != 0) {
+            print "Поколений пока нет. Выполните 'vix switch'."
+            exit 0
+        }
+
+        gens_cmd = "find \"" VOID_STORE "\" -mindepth 1 -maxdepth 1 -type d ! -name current -print0 2>/dev/null | xargs -0r ls -td 2>/dev/null"
+        gen_count = 0
+        while ((gens_cmd | getline gdir) > 0) gen_list[++gen_count] = gdir
+        close(gens_cmd)
+
+        if (gen_count == 0) {
+            print "Поколений пока нет. Выполните 'vix switch'."
+            exit 0
+        }
+
+        current_dir = ""
+        readlink_cmd = "readlink -f \"" VOID_STORE "/current\" 2>/dev/null"
+        if ((readlink_cmd | getline current_dir) > 0) gsub(/[ \t\r\n]/, "", current_dir)
+        close(readlink_cmd)
+
+        for (i = 1; i <= gen_count; i++) {
+            n = split(gen_list[i], gpp, "/")
+            hname = gpp[n]
+            date_cmd = "date -r \"" gen_list[i] "\" '+%Y-%m-%d %H:%M' 2>/dev/null"
+            gdate = ""
+            if ((date_cmd | getline gdate) > 0) gsub(/\r|\n/, "", gdate)
+            close(date_cmd)
+            marker = (gen_list[i] == current_dir) ? "  <- текущее" : ""
+            printf "  %-3d %-24s %s%s\n", (i - 1), hname, gdate, marker
+        }
+        print "\nОткат: vix rollback [индекс|хэш]  (без аргумента - на предыдущее)"
+        exit 0
+    }
+
+    # --- КОМАНДА: ROLLBACK (Откат на предыдущее/выбранное поколение) ---
+    if (cmd == "rollback" || cmd == "r") {
+        print "=== Откат поколения VIX ==="
+        if (system("[ -d \"" VOID_CONFIG "\" ]") != 0) {
+            print "\033[31m" "Ошибка: Сначала выполните 'vix sync'" "\033[0m"
+            exit 1
+        }
+        if (system("[ -d \"" VOID_STORE "\" ]") != 0) {
+            print "\033[31m" "Ошибка: Ни одного поколения ещё не зафиксировано." "\033[0m"
+            exit 1
+        }
+
+        gens_cmd = "find \"" VOID_STORE "\" -mindepth 1 -maxdepth 1 -type d ! -name current -print0 2>/dev/null | xargs -0r ls -td 2>/dev/null"
+        gen_count = 0
+        while ((gens_cmd | getline gdir) > 0) gen_list[++gen_count] = gdir
+        close(gens_cmd)
+
+        if (gen_count == 0) {
+            print "\033[31m" "Ошибка: Ни одного поколения ещё не зафиксировано." "\033[0m"
+            exit 1
+        }
+
+        current_dir = ""
+        readlink_cmd = "readlink -f \"" VOID_STORE "/current\" 2>/dev/null"
+        if ((readlink_cmd | getline current_dir) > 0) gsub(/[ \t\r\n]/, "", current_dir)
+        close(readlink_cmd)
+        if (current_dir == "") current_dir = gen_list[1]
+
+        target_arg = ARGV[2]
+        target_dir = ""
+
+        if (target_arg == "") {
+            cur_idx = 0
+            for (i = 1; i <= gen_count; i++) {
+                if (gen_list[i] == current_dir) { cur_idx = i; break }
+            }
+            if (cur_idx == 0) cur_idx = 1
+            if (cur_idx + 1 > gen_count) {
+                print "\033[31m" "Ошибка: Более старых поколений не найдено." "\033[0m"
+                exit 1
+            }
+            target_dir = gen_list[cur_idx + 1]
+        } else if (target_arg ~ /^[0-9]+$/) {
+            idx = target_arg + 1
+            if (idx < 1 || idx > gen_count) {
+                print "\033[31m" "Ошибка: Индекс " target_arg " вне диапазона. Смотрите 'vix list'." "\033[0m"
+                exit 1
+            }
+            target_dir = gen_list[idx]
+        } else {
+            for (i = 1; i <= gen_count; i++) {
+                n = split(gen_list[i], gpp, "/")
+                hname = gpp[n]
+                if (index(hname, target_arg) == 1) { target_dir = gen_list[i]; break }
+            }
+            if (target_dir == "") {
+                print "\033[31m" "Ошибка: Поколение '" target_arg "' не найдено. Смотрите 'vix list'." "\033[0m"
+                exit 1
+            }
+        }
+
+        if (target_dir == current_dir) {
+            print "-> Уже находитесь на этом поколении."
+            exit 0
+        }
+
+        n = split(target_dir, gpp, "/")
+
+        if (current_dir != "") {
+            live_dotfiles_hash = get_dir_hash(DOTFILES)
+            cur_gen_dotfiles_hash = get_dir_hash(current_dir "/dotfiles")
+            if (live_dotfiles_hash != "" && live_dotfiles_hash != cur_gen_dotfiles_hash) {
+                print "-> ВНИМАНИЕ: живые дотфайлы отличаются от последнего зафиксированного поколения."
+                print "   Несохранённые (не прогнанные через 'vix switch') изменения будут потеряны безвозвратно."
+            }
+        }
+
+        print "-> Откатываюсь на поколение: " gpp[n]
+        print "-> Восстанавливаю манифесты (дотфайлы, пакеты, сервисы, репозитории) из слепка..."
+
+        if (system("[ -d \"" target_dir "/dotfiles\" ]") == 0) {
+            system("find \"" DOTFILES "\" -mindepth 1 -maxdepth 1 -exec rm -rf {} +")
+            system("cp -a \"" target_dir "\"/dotfiles/. \"" DOTFILES "\"/ 2>/dev/null")
+        }
+        if (system("[ -f \"" target_dir "/packages.vix\" ]") == 0) {
+            system("cp -a \"" target_dir "/packages.vix\" \"" PKG_FILE "\"")
+        }
+        if (system("[ -f \"" target_dir "/services.vix\" ]") == 0) {
+            system("cp -a \"" target_dir "/services.vix\" \"" SVC_FILE "\"")
+        }
+        if (system("[ -f \"" target_dir "/repo.vix\" ]") == 0) {
+            system("cp -a \"" target_dir "/repo.vix\" \"" REPO_FILE "\"")
+        }
+
+        # Папки, добавленные через 'vix add' - восстанавливаем реестр extra.vix
+        # и содержимое каждой папки прямо в корень config.vix (как и требуется).
+        system("rm -f \"" EXTRA_FILE "\"")
+        if (system("[ -f \"" target_dir "/extra.vix\" ]") == 0) {
+            system("cp -a \"" target_dir "/extra.vix\" \"" EXTRA_FILE "\"")
+            while ((getline rb_line < EXTRA_FILE) > 0) {
+                if (rb_line == "") continue
+                rb_eq = index(rb_line, "=")
+                if (rb_eq <= 0) continue
+                rb_name = substr(rb_line, 1, rb_eq-1)
+                rb_src = target_dir "/extra/" rb_name
+                if (system("[ -d \"" rb_src "\" ]") == 0) {
+                    rb_dst = VOID_CONFIG "/" rb_name
+                    system("rm -rf \"" rb_dst "\"")
+                    mkdir_p(rb_dst)
+                    system("cp -a \"" rb_src "\"/. \"" rb_dst "\"/ 2>/dev/null")
+                }
+            }
+            close(EXTRA_FILE)
+        }
+
+        print "-> Манифесты восстановлены. Запускаю конвейер применения..."
+        cmd = "switch"
+    }
+
+    # --- КОМАНДА: SWITCH (Файл -> Система) ---
+    if (cmd == "switch" || cmd == "s") {
+        print "=== Конвейер сборки окружения VIX (Файл -> Система) ==="
+        
+        if (system("[ -d \"" DOTFILES "\" ]") != 0) {
+            print "\033[31m" "Ошибка: Папка " DOTFILES " не найдена. Сначала запустите 'vix sync'." "\033[0m"
+            exit 1
+        }
+
+        # ----------------------------------------------------
+        # ШАГ А: ПРОВЕРКА ХЭШЕЙ КОМПОНЕНТОВ
+        # ----------------------------------------------------
+        print "\n--- [Шаг А: Проверка изменений компонентов] ---"
+
+        # Доп. папки (vix add) - если ни одной не зарегистрировано, весь
+        # связанный с ними код (гейт, Шаг Е) просто не появляется.
+        has_extra = (system("[ -s \"" EXTRA_FILE "\" ]") == 0)
+
+        # Общий хэш всей конфигурации - используется только для имени слепка
+        HASH = compute_combined_hash()
+
+        if (length(HASH) < 10) {
+            print "\033[31m" "Ошибка: Не удалось сгенерировать хэш конфигурации." "\033[0m"
+            exit 1
+        }
+        CURRENT_STORE = VOID_STORE "/" HASH
+
+        # Ищем последнее зафиксированное поколение для поэлементного сравнения
+        last_store_cmd = "find \"" VOID_STORE "\" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | xargs -r ls -td 2>/dev/null | head -n1"
+        last_store_dir = ""
+        if ((last_store_cmd | getline last_store_dir) > 0) gsub(/[ \t\r\n]/, "", last_store_dir)
+        close(last_store_cmd)
+
+        skip_dotfiles = 0
+        skip_services = 0
+        skip_repo = 0
+        skip_packages = 0
+        skip_extra = 0
+
+        if (last_store_dir == "") {
+            print "  -> Предыдущих поколений не найдено. Требуется полная синхронизация."
+        } else {
+            print "  -> Сравниваю с поколением: " last_store_dir
+
+            cur_dotfiles_hash = get_dir_hash(DOTFILES)
+            old_dotfiles_hash = get_dir_hash(last_store_dir "/dotfiles")
+            if (cur_dotfiles_hash != "" && cur_dotfiles_hash == old_dotfiles_hash) {
+                skip_dotfiles = 1
+                print "  -> [Дотфайлы]    без изменений -> Шаг Б будет пропущен"
+            } else {
+                print "  -> [Дотфайлы]    обнаружены изменения"
+            }
+
+            cur_svc_hash = get_file_hash(SVC_FILE)
+            old_svc_hash = get_file_hash(last_store_dir "/services.vix")
+            if (cur_svc_hash != "" && cur_svc_hash == old_svc_hash) {
+                skip_services = 1
+                print "  -> [Сервисы]     без изменений -> Шаг В будет пропущен"
+            } else {
+                print "  -> [Сервисы]     обнаружены изменения"
+            }
+
+            cur_repo_hash = get_file_hash(REPO_FILE)
+            old_repo_hash = get_file_hash(last_store_dir "/repo.vix")
+            if (cur_repo_hash != "" && cur_repo_hash == old_repo_hash) {
+                skip_repo = 1
+                print "  -> [Репозитории] без изменений -> Шаг Г будет пропущен"
+            } else {
+                print "  -> [Репозитории] обнаружены изменения"
+            }
+
+            cur_pkg_hash = get_file_hash(PKG_FILE)
+            old_pkg_hash = get_file_hash(last_store_dir "/packages.vix")
+            if (cur_pkg_hash != "" && cur_pkg_hash == old_pkg_hash) {
+                skip_packages = 1
+                print "  -> [Пакеты]      без изменений -> Шаг Д будет пропущен"
+            } else {
+                print "  -> [Пакеты]      обнаружены изменения"
+            }
+
+            if (has_extra) {
+                cur_extra_hash = get_extra_combined_hash(0)
+                old_extra_hash = get_extra_combined_hash(1)
+                if (cur_extra_hash != "" && cur_extra_hash == old_extra_hash) {
+                    skip_extra = 1
+                    print "  -> [Доп. папки]  без изменений -> Шаг Е будет пропущен"
+                } else {
+                    print "  -> [Доп. папки]  обнаружены изменения"
+                }
+            }
+        }
+
+        if (last_store_dir != "" && skip_dotfiles && skip_repo && skip_packages && skip_services && (!has_extra || skip_extra)) {
+            print "\n-> Все компоненты идентичны последнему поколению."
+            print "-> Система полностью соответствует манифестам. Новый слепок не создаётся."
+            system("ln -sfn \"" HASH "\" \"" VOID_STORE "/current\"")
+            prune_old_generations()
+            exit 0
+        }
+
+        print "-> Запуск конвейера. Текущий хэш конфигурации: " HASH
+
+        # ----------------------------------------------------
+        # ШАГ Б: ФИЗИЧЕСКОЕ ОБНОВЛЕНИЕ ДОТФАЙЛОВ В ХОМЯКЕ
+        # ----------------------------------------------------
+        if (!skip_dotfiles) {
+        print "\n--- [Шаг Б: Синхронизация дотфайлов] ---"
+        ln_cmd = "find \"" DOTFILES "\" -maxdepth 1 -type f -name '.*'"
+        while ((ln_cmd | getline dotfile) > 0) {
+            n = split(dotfile, parts, "/")
+            filename = parts[n]
+            target_file = USER_HOME "/" filename
+            
+            if (system("[ -L \"" target_file "\" ]") == 0) {
+                system("rm -f \"" target_file "\"")
+            }
+            
+            if (system("cmp -s \"" dotfile "\" \"" target_file "\"") != 0) {
+                print "  -> Изменение обнаружено! Обновление дотфайла: " filename
+                system("cp -f \"" dotfile "\" \"" target_file "\"")
+                system("chmod +x \"" target_file "\"")
+            }
+        }
+        close(ln_cmd)
+        }
+
+        # ----------------------------------------------------
+        # ШАГ В: ДЕКЛАРАТИВНАЯ СИНХРОНИЗАЦИЯ СЕРВИСОВ
+        # ----------------------------------------------------
+        if (!skip_services && system("[ -f \"" SVC_FILE "\" ]") == 0) {
+            print "\n--- [Шаг В: Декларативная синхронизация сервисов] ---"
+            print "[Анализ манифеста сервисов...]"
+            
+            delete target_services
+            delete seen_services_switch
+            current_section = ""
+
+            while ((getline line < SVC_FILE) > 0) {
+                gsub(/^[ \t]+|[ \t]+$/, "", line)
+                if (line == "") continue
+                
+                if (line ~ /^#.*var\/service/) { current_section = "var"; continue }
+                if (line ~ /^#.*etc\/sv/) { current_section = "etc"; continue }
+                if (line ~ /^#/) continue
+                
+                if (line ~ /=/) {
+                    split(line, svc_parts, "[ \t]*=[ \t]*")
+                    service = svc_parts[1]
+                    status = svc_parts[2]
+                    gsub(/[ \t\r\n]/, "", service)
+                    gsub(/[ \t\r\n]/, "", status)
+                    
+                    if (system("[ -d \"/etc/sv/" service "\" ]") != 0) {
+                        continue
+                    }
+                    
+                    if (service in seen_services_switch) continue
+                    seen_services_switch[service] = 1
+
+                    if (current_section == "etc" && status == "true") {
+                        resolved_status = "true"
+                    } else {
+                        resolved_status = status
+                    }
+                    
+                    target_services[service] = resolved_status
+                     
+                    has_symlink = (system("[ -L \"/var/service/" service "\" ]") == 0)
+                    has_down = (system("[ -f \"/etc/sv/" service "/down\" ]") == 0)
+
+                    if (resolved_status == "true") {
+                        if (!has_symlink || has_down) {
+                            print "  [!] Изменение конфигурации -> Сервис [" service "]: Включение (true)"
+                            system("sudo rm -f \"/etc/sv/" service "/down\"")
+                            if (!has_symlink) {
+                                system("sudo ln -s \"/etc/sv/" service "\" \"/var/service/\"")
+                            }
+                        }
+                    } else if (resolved_status == "false" && current_section == "var") {
+                        if (!has_symlink || !has_down) {
+                            print "  [!] Изменение конфигурации -> Сервис [" service "]: Ограничение автозапуска (false в var)"
+                            system("sudo touch \"/etc/sv/" service "/down\"")
+                            if (!has_symlink) {
+                                system("sudo ln -s \"/etc/sv/" service "\" \"/var/service/\"")
+                            }
+                        }
+                    } else if (resolved_status == "false" && current_section == "etc") {
+                        if (has_symlink || !has_down) {
+                            print "  [!] Изменение конфигурации -> Сервис [" service "]: Отключение и утилизация симлинка (false в etc)"
+                            system("sudo touch \"/etc/sv/" service "/down\"")
+                            if (has_symlink) {
+                                system("sudo rm -f \"/var/service/" service "\"")
+                                system("sudo sv stop \"" service "\" >/dev/null 2>&1")
+                            }
+                        }
+                    }
+                }
+            }
+            close(SVC_FILE)
+            
+            generate_services_config(SVC_FILE)
+            
+            sv_clean_cmd = "find /var/service -maxdepth 1 -mindepth 1 -type l"
+            while ((sv_clean_cmd | getline active_svc) > 0) {
+                sub(".*/", "", active_svc)
+                if (!(active_svc in target_services)) {
+                    print "  [!] Найдено расхождение -> Убираю незадекларированный сервис: " active_svc
+                    system("sudo touch \"/etc/sv/" active_svc "/down\"")
+                    system("sudo rm -f \"/var/service/" active_svc "\"")
+                    system("sudo sv stop \"" active_svc "\" >/dev/null 2>&1")
+                }
+            }
+            close(sv_clean_cmd)
+        }
+
+        # ----------------------------------------------------
+        # ШАГ Г: ДЕКЛАРАТИВНЫЕ РЕПОЗИТОРИИ ИЗ ПЛОСКИХ ФАЙЛОВ
+        # ----------------------------------------------------
+        if (!skip_repo) {
+            print "\n--- [Шаг Г: Синхронизация репозиториев XBPS] ---"
+            rep_ch = deserialize_repo_all(REPO_FILE)
+
+            if (rep_ch == 1) {
+                print "  -> Обнаружены изменения в репозиториях. Принудительно обновляю индексы XBPS..."
+                if (system("sudo xbps-install -S") != 0) {
+                    print "\033[31m" "  [!] Ошибка: не удалось обновить индексы репозиториев." "\033[0m"
+                    PIPELINE_HAD_ERRORS = 1
+                }
+            } else {
+                print "  -> Изменений в репозиториях не обнаружено."
+            }
+        }
+
+        # ----------------------------------------------------
+        # ШАГ Д: ДЕКЛАРАТИВНАЯ СИНХРОНИЗАЦИЯ ПАКЕТОВ
+        # ----------------------------------------------------
+        if (!skip_packages && system("[ -f \"" PKG_FILE "\" ]") == 0) {
+                print "\n--- [Шаг Д: Декларативная синхронизация пакетов] ---"
+                print "[Индексирование установленных пакетов...]"
+
+                delete installed_packages
+                local_cache_cmd = "xbps-query -l | awk '{print $2}'"
+                while ((local_cache_cmd | getline l_pkg) > 0) {
+                    l_pkg_clean = clean_package_name(l_pkg)
+                    if (l_pkg_clean != "") installed_packages[l_pkg_clean] = 1
+                }
+                close(local_cache_cmd)
+
+                print "[Анализ манифеста на предмет расхождений с системой...]"
+
+                delete target_packages
+                delete processed_packages
+                while ((getline line < PKG_FILE) > 0) {
+                    gsub(/^[ \t]+|[ \t]+$/, "", line)
+                    if (line == "" || line ~ /^#/) continue
+
+                    current_pkg = clean_package_name(line)
+
+                    if (current_pkg != "" && !(current_pkg in processed_packages)) {
+                        processed_packages[current_pkg] = 1
+                        target_packages[current_pkg] = 1
+                    }
+                }
+                close(PKG_FILE)
+
+                # Находим разницу между желаемым (манифест) и фактическим (система) состоянием
+                pkgs_to_remove = ""
+                for (p in installed_packages) {
+                    if (!(p in target_packages)) pkgs_to_remove = pkgs_to_remove " " p
+                }
+
+                pkgs_to_install = ""
+                for (p in target_packages) {
+                    if (!(p in installed_packages)) {
+                        # Проверяем, не удовлетворён ли пакет уже (в т.ч. виртуальный/alternatives,
+                        # напр. libGL/libEGL/awk и т.п. - они не попадают в installed_packages
+                        # по имени напрямую, но уже предоставлены другим установленным пакетом)
+                        already_satisfied_cmd = "xbps-query \"" p "\" >/dev/null 2>&1"
+                        if (system(already_satisfied_cmd) == 0) {
+                            continue
+                        }
+
+                        check_repo = "xbps-query -R " p " >/dev/null 2>&1"
+                        if (system(check_repo) == 0) {
+                            pkgs_to_install = pkgs_to_install " " p
+                        } else {
+                            print "  -> Пакет [" p "] не найден в репозиториях, пропускаю."
+                        }
+                    }
+                }
+
+                if (pkgs_to_remove == "" && pkgs_to_install == "") {
+                    print "  -> Расхождений не найдено, пул пакетов уже синхронизирован."
+                } else {
+                    pkg_step_ok = 1
+
+                    if (pkgs_to_remove != "") {
+                        print "[Транзакция удаления]: Удаление пула пакетов..."
+                        if (system("sudo xbps-remove -RfOoy" pkgs_to_remove) != 0) {
+                            print "\033[31m" "  [!] Ошибка: xbps-remove завершился с ошибкой." "\033[0m"
+                            pkg_step_ok = 0
+                        }
+                    }
+
+                    if (pkg_step_ok && pkgs_to_install != "") {
+                        print "[Транзакция установки]: Установка пула пакетов..."
+                        if (system("sudo xbps-install -S -y" pkgs_to_install) != 0) {
+                            print "\033[31m" "  [!] Ошибка: xbps-install завершился с ошибкой." "\033[0m"
+                            pkg_step_ok = 0
+                        }
+                    }
+
+                    if (pkg_step_ok) {
+                        print "[Пересборка манифеста пакетов с актуальными зависимостями...]"
+                        generate_packages_config(PKG_FILE)
+                    } else {
+                        print "  -> Манифест packages.vix НЕ обновлён из-за ошибки транзакции."
+                        print "  -> При следующем запуске 'vix switch' Шаг Д повторится."
+                        PIPELINE_HAD_ERRORS = 1
+                    }
+                }
+        }
+
+        # ----------------------------------------------------
+        # ШАГ Е: ПОЛЬЗОВАТЕЛЬСКИЕ ПАПКИ (vix add)
+        # ----------------------------------------------------
+        # Появляется только если 'vix add' хотя бы раз использовался.
+        if (has_extra && !skip_extra) {
+            print "\n--- [Шаг Е: Синхронизация пользовательских папок (vix add)] ---"
+            while ((getline ex_line < EXTRA_FILE) > 0) {
+                if (ex_line == "") continue
+                ex_eq = index(ex_line, "=")
+                if (ex_eq <= 0) continue
+                ex_name = substr(ex_line, 1, ex_eq-1)
+                ex_path = substr(ex_line, ex_eq+1)
+                ex_manifest = VOID_CONFIG "/" ex_name
+
+                if (system("[ ! -d \"" ex_manifest "\" ]") == 0) {
+                    print "  -> [" ex_name "] пропущена: нет в config.vix/, хотя зарегистрирована в extra.vix"
+                    continue
+                }
+
+                ex_cur_h = get_dir_hash(ex_manifest)
+                ex_live_h = get_dir_hash(ex_path)
+                if (ex_cur_h != ex_live_h) {
+                    print "  -> Изменение обнаружено! Обновляю: " ex_path
+                    system("mkdir -p \"" ex_path "\"")
+                    system("find \"" ex_path "\" -mindepth 1 -maxdepth 1 -exec rm -rf {} +")
+                    system("cp -a \"" ex_manifest "\"/. \"" ex_path "\"/ 2>/dev/null")
+                } else {
+                    print "  -> [" ex_name "] уже соответствует манифесту, пропускаю."
+                }
+            }
+            close(EXTRA_FILE)
+        }
+
+        # ----------------------------------------------------
+        # СБОРКА И ЗАМОРОЗКА СЛЕПКА ПОКОЛЕНИЯ
+        # ----------------------------------------------------
+        if (PIPELINE_HAD_ERRORS) {
+            print "\n--- [Фиксация состояния системы] ---"
+            print "\033[31m" "-> В конвейере были ошибки (см. вывод выше)." "\033[0m"
+            print "\033[31m" "-> Слепок НЕ фиксируется - система не в полном соответствии с манифестами." "\033[0m"
+            print "\033[31m" "-> Указатель 'текущее поколение' не трогаю, исправьте проблему и запустите 'vix switch' снова." "\033[0m"
+            exit 1
+        }
+
+        # Пересчитываем хэш ПОСЛЕ выполнения всех шагов: Шаги В/Д/Е могут сами
+        # переписать services.vix/packages.vix/extra-папки (самокоррекция
+        # манифеста под реальное состояние системы) уже после того, как HASH
+        # был посчитан в Шаге А. Без пересчёта имя папки в store/ могло бы не
+        # соответствовать её фактическому содержимому.
+        final_hash = compute_combined_hash()
+        if (length(final_hash) >= 10) {
+            HASH = final_hash
+            CURRENT_STORE = VOID_STORE "/" HASH
+        }
+
+        print "\n--- [Фиксация состояния системы] ---"
+        print "Текущий хэш поколения: " HASH
+
+        if (system("[ -d \"" CURRENT_STORE "\" ]") == 0) {
+            print "-> Такое поколение уже есть в store, переиспользую существующий слепок."
+        } else {
+            # Атомарная публикация: собираем слепок во временной staging-папке и
+            # публикуем через переименование (rename атомарен на одной ФС) - так
+            # store/<HASH> либо не существует вовсе, либо существует полностью
+            # готовым. Если процесс прервётся посередине - незавершённый staging
+            # просто останется мусором рядом, а не "притворится" готовым слепком.
+            staging_dir = VOID_STORE "/.staging-" HASH "." PROCINFO["pid"]
+            system("rm -rf \"" staging_dir "\"")
+
+            print "Создаем неизменяемый слепок поколения..."
+            mkdir_p(staging_dir "/dotfiles")
+            system("find \"" DOTFILES "\" -mindepth 1 -maxdepth 1 -exec cp -a {} \"" staging_dir "/dotfiles/\" \\;")
+
+            if (system("[ -f \"" PKG_FILE "\" ]") == 0) system("cp -a \"" PKG_FILE "\" \"" staging_dir "/\"")
+            if (system("[ -f \"" SVC_FILE "\" ]") == 0) system("cp -a \"" SVC_FILE "\" \"" staging_dir "/\"")
+            if (system("[ -f \"" REPO_FILE "\" ]") == 0) system("cp -a \"" REPO_FILE "\" \"" staging_dir "/\"")
+
+            if (has_extra) {
+                system("cp -a \"" EXTRA_FILE "\" \"" staging_dir "/\"")
+                mkdir_p(staging_dir "/extra")
+                while ((getline fz_line < EXTRA_FILE) > 0) {
+                    if (fz_line == "") continue
+                    fz_eq = index(fz_line, "=")
+                    if (fz_eq <= 0) continue
+                    fz_name = substr(fz_line, 1, fz_eq-1)
+                    fz_src = VOID_CONFIG "/" fz_name
+                    if (system("[ -d \"" fz_src "\" ]") == 0) {
+                        mkdir_p(staging_dir "/extra/" fz_name)
+                        system("cp -a \"" fz_src "\"/. \"" staging_dir "/extra/" fz_name "\"/ 2>/dev/null")
+                    }
+                }
+                close(EXTRA_FILE)
+            }
+
+            system("find \"" staging_dir "\" -type d -exec chmod 555 {} +")
+            system("find \"" staging_dir "\" -type f -exec chmod 444 {} +")
+
+            if (system("mv \"" staging_dir "\" \"" CURRENT_STORE "\" 2>/dev/null") == 0) {
+                print "\033[32m" "Слепок успешно зафиксирован: " CURRENT_STORE "\033[0m"
+            } else {
+                print "\033[31m" "  [!] Не удалось атомарно опубликовать слепок (возможно, гонка с другим процессом)." "\033[0m"
+                system("chmod -R u+w \"" staging_dir "\" 2>/dev/null")
+                system("rm -rf \"" staging_dir "\"")
+            }
+        }
+
+        # Универсальный указатель "текущее поколение" - не зависит от загрузчика
+        system("ln -sfn \"" HASH "\" \"" VOID_STORE "/current\"")
+        print "-> Текущее поколение помечено: " HASH
+
+        prune_old_generations()
+
+        print "\nКонвейер VIX успешно выполнен! Система под тотальным декларативным контролем."
+        exit 0
+    }
+    
+    print ""
+
+    print "\033[32m" \
+          " ██╗   ██╗ ██╗ ██╗  ██╗\n" \
+          " ██║   ██║ ██║ ╚██╗██╔╝\n" \
+          " ██║   ██║ ██║  ╚███╔╝ \n" \
+          " ╚██╗ ██╔╝ ██║  ██╔██╗ \n" \
+          "  ╚████╔╝  ██║ ██╔╝ ██╗\n" \
+          "   ╚═══╝   ╚═╝ ╚═╝  ╚═╝" \
+          "\033[0m"
+    print ""
+    print "Доступные команды:"
+    print "  sync          Создать/обновить config.vix из текущей системы (дотфайлы, пакеты, сервисы, репо)"
+    print "  switch, s     Применить конфигурацию (дотфайлы, сервисы, репозитории, пакеты, доп. папки)"
+    print "  add, a        Добавить папку под управление VIX: vix add /путь/к/папке"
+    print "  list, l       Список зафиксированных поколений"
+    print "  rollback, r   Откат на предыдущее (или указанное) поколение"
+    print ""
+    print "Использование: vix [команда]"
+    exit 1
+}
+
+# exit из BEGIN передаёт управление сюда (стандартное поведение awk) - это
+# гарантирует снятие блокировки при ЛЮБОМ выходе из скрипта (успех, ошибка,
+# ранний exit), а не только при "счастливом" пути.
+END {
+    release_lock()
+}
